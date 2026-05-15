@@ -34,19 +34,19 @@ Monolito modular. Un solo proceso, una sola base de datos, módulos independient
 
 Módulos previstos:
 
-| Módulo         | Responsabilidad                                                 |
-|----------------|------------------------------------------------------------------|
-| `auth`         | Login, signup, refresh, password reset, guards JWT               |
-| `tenants`      | CRUD de tenants, resolución por subdominio, branding             |
-| `users`        | Usuarios (OWNER, TRAINER, STUDENT), perfil, estado activo/inactivo |
-| `exercises`    | Catálogo de ejercicios (título, descripción, media URL)          |
-| `routines`     | Rutinas y items de rutina (ejercicios con series/reps prescritas) |
-| `assignments` | Asignación rutina ↔ alumno con fecha de vigencia                 |
-| `sessions`    | Ejecución de una rutina por parte de un alumno en una fecha      |
-| `tracking`     | Sets ejecutados (reps reales, peso real) y personal records      |
-| `comments`     | Comentarios del alumno sobre ejercicios (fase 2: visible al PT)  |
-| `media`        | Subida y firma de URLs para videos/gifs en R2                    |
-| `billing`      | Stub para fase 2. Suscripciones del entrenador                    |
+| Módulo        | Responsabilidad                                                    |
+| ------------- | ------------------------------------------------------------------ |
+| `auth`        | Login, signup, refresh, password reset, guards JWT                 |
+| `tenants`     | CRUD de tenants, resolución por subdominio, branding               |
+| `users`       | Usuarios (OWNER, TRAINER, STUDENT), perfil, estado activo/inactivo |
+| `exercises`   | Catálogo de ejercicios (título, descripción, media URL)            |
+| `routines`    | Rutinas y items de rutina (ejercicios con series/reps prescritas)  |
+| `assignments` | Asignación rutina ↔ alumno con fecha de vigencia                   |
+| `sessions`    | Ejecución de una rutina por parte de un alumno en una fecha        |
+| `tracking`    | Sets ejecutados (reps reales, peso real) y personal records        |
+| `comments`    | Comentarios del alumno sobre ejercicios (fase 2: visible al PT)    |
+| `media`       | Subida y firma de URLs para videos/gifs en R2                      |
+| `billing`     | Stub para fase 2. Suscripciones del entrenador                     |
 
 ### `apps/web` — Frontend Next.js
 
@@ -54,11 +54,11 @@ App Router. Mobile-first con Tailwind. shadcn/ui como base de componentes.
 
 Tres "superficies" lógicas dentro de una sola app Next:
 
-| Superficie          | Host                          | Para quién                |
-|---------------------|-------------------------------|---------------------------|
-| Landing pública     | `rutinex.app`                 | Visitantes, marketing      |
-| Admin del entrenador| `app.rutinex.app`             | OWNERS y TRAINERS          |
-| App del alumno      | `<tenant>.rutinex.app`        | STUDENTS de ese tenant     |
+| Superficie           | Host                   | Para quién             |
+| -------------------- | ---------------------- | ---------------------- |
+| Landing pública      | `rutinex.app`          | Visitantes, marketing  |
+| Admin del entrenador | `app.rutinex.app`      | OWNERS y TRAINERS      |
+| App del alumno       | `<tenant>.rutinex.app` | STUDENTS de ese tenant |
 
 La distinción la hace un middleware Next que lee el host del request y enruta a layouts/segmentos distintos. Ver `docs/03-multi-tenancy.md`.
 

@@ -30,15 +30,15 @@ modules/routines/
 
 ## REST conventions
 
-| Método  | Ruta                              | Caso típico                                       |
-|---------|-----------------------------------|---------------------------------------------------|
-| GET     | `/routines`                       | Lista paginada.                                   |
-| GET     | `/routines/:id`                   | Detalle.                                          |
-| POST    | `/routines`                       | Crear.                                            |
-| PATCH   | `/routines/:id`                   | Actualización parcial.                            |
-| DELETE  | `/routines/:id`                   | Borrado (lógico o duro según el caso).            |
-| POST    | `/routines/:id/assignments`       | Sub-recurso: asignar.                             |
-| GET     | `/students/:id/sessions/today`    | Recursos derivados, ruta con sentido para el cliente. |
+| Método | Ruta                           | Caso típico                                           |
+| ------ | ------------------------------ | ----------------------------------------------------- |
+| GET    | `/routines`                    | Lista paginada.                                       |
+| GET    | `/routines/:id`                | Detalle.                                              |
+| POST   | `/routines`                    | Crear.                                                |
+| PATCH  | `/routines/:id`                | Actualización parcial.                                |
+| DELETE | `/routines/:id`                | Borrado (lógico o duro según el caso).                |
+| POST   | `/routines/:id/assignments`    | Sub-recurso: asignar.                                 |
+| GET    | `/students/:id/sessions/today` | Recursos derivados, ruta con sentido para el cliente. |
 
 - Plural siempre.
 - IDs en URL siempre como UUID.
@@ -49,6 +49,7 @@ modules/routines/
 Cursor-based para listas que crecen (sets, sessions, comments). Offset para listas chicas (users del tenant).
 
 **Cursor**:
+
 ```
 GET /sessions?limit=20&cursor=<opaque>
 → {
@@ -58,6 +59,7 @@ GET /sessions?limit=20&cursor=<opaque>
 ```
 
 **Offset**:
+
 ```
 GET /users?page=1&pageSize=20
 → {
@@ -96,7 +98,10 @@ Para query params:
 
 ```ts
 export class ListRoutinesQuery {
-  @IsInt() @Min(1) @Max(100) @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @Type(() => Number)
   @IsOptional()
   limit?: number = 20;
 
@@ -109,16 +114,19 @@ export class ListRoutinesQuery {
 ## Response shapes
 
 Todas las responses de listas:
+
 ```ts
 { data: T[], nextCursor?: string, page?, pageSize?, total? }
 ```
 
 Todas las responses de un recurso:
+
 ```ts
-T  // el recurso, sin wrapper
+T; // el recurso, sin wrapper
 ```
 
 Errores: formato estándar de NestJS, el filtro global asegura:
+
 ```json
 {
   "statusCode": 400,
@@ -148,14 +156,14 @@ findAll(@TenantId() tenantId: string, @Query() query: ListRoutinesQuery) {
 
 ## Errores
 
-| Caso                                        | Excepción                          |
-|---------------------------------------------|------------------------------------|
-| Recurso no existe en este tenant            | `NotFoundException`                |
-| Recurso existe pero no podés tocarlo        | `ForbiddenException`               |
-| Input inválido                              | DTO ya lo maneja → 400 automático  |
-| Conflicto (slug tomado, email duplicado)    | `ConflictException`                |
-| Sin auth                                    | `UnauthorizedException`            |
-| Estado inválido (sesión ya completada, etc.)| `BadRequestException` con código   |
+| Caso                                         | Excepción                         |
+| -------------------------------------------- | --------------------------------- |
+| Recurso no existe en este tenant             | `NotFoundException`               |
+| Recurso existe pero no podés tocarlo         | `ForbiddenException`              |
+| Input inválido                               | DTO ya lo maneja → 400 automático |
+| Conflicto (slug tomado, email duplicado)     | `ConflictException`               |
+| Sin auth                                     | `UnauthorizedException`           |
+| Estado inválido (sesión ya completada, etc.) | `BadRequestException` con código  |
 
 Para errores de negocio con códigos parseables por frontend:
 

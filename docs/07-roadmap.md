@@ -11,6 +11,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: estructura base con pnpm workspaces.
 
 **Hacer**:
+
 - `package.json` raíz con `workspaces: ["apps/*", "packages/*"]`, `pnpm-workspace.yaml`.
 - `apps/api/` con `nest new` (sin git).
 - `apps/web/` con `create-next-app` (TypeScript, Tailwind, App Router, src=no, eslint sí).
@@ -28,6 +29,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: ESLint + Prettier compartidos, husky + lint-staged.
 
 **Hacer**:
+
 - ESLint config raíz compartida (`@typescript-eslint`).
 - Prettier config raíz.
 - Husky con pre-commit que corra lint-staged sobre staged files.
@@ -44,6 +46,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: API conecta a Postgres local y crea la primera tabla.
 
 **Hacer**:
+
 - `docker-compose.yml` en raíz con Postgres 16.
 - TypeORM config en `apps/api/src/config/database.ts`. Lee de env.
 - Entity `Tenant` (mínima: id, slug, name, branding, is_active, timestamps).
@@ -59,6 +62,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: CRUD básico de tenant y endpoint para resolver tenant por slug.
 
 **Hacer**:
+
 - `TenantsModule`, `TenantsService`, `TenantsController`.
 - `POST /tenants` (sin auth todavía, lo abrimos para signup en step 7).
 - `GET /tenants/by-slug/:slug` → devuelve `{ id, slug, name, branding }` (público, sin datos sensibles).
@@ -73,6 +77,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: tabla `users` y CRUD interno.
 
 **Hacer**:
+
 - Entity `User` con todos los campos de `docs/02-dominio.md`.
 - Migración.
 - `UsersModule` con service. **Sin endpoints públicos** todavía; lo va a usar `auth`.
@@ -87,6 +92,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: hashear y verificar passwords.
 
 **Hacer**:
+
 - `apps/api/src/modules/auth/password.service.ts` con `hash` y `verify`.
 - Params Argon2id según `docs/04-auth.md`.
 - Unit tests: roundtrip, rechazo de password incorrecta.
@@ -100,6 +106,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: endpoint público que crea tenant + OWNER en una transacción.
 
 **Hacer**:
+
 - `POST /auth/signup` con DTO (slug, tenantName, email, password, firstName, lastName).
 - Validación: slug disponible, email no duplicado dentro de un tenant nuevo (irrelevant), password fuerte.
 - Crear `tenant` (status `trial`) + `user` (OWNER) en una transacción.
@@ -114,6 +121,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: login emite access token. Sin refresh todavía.
 
 **Hacer**:
+
 - `POST /auth/login`. Resolución de tenant según `docs/04-auth.md` flujo Login.
 - Passport `LocalStrategy` + `JwtStrategy`.
 - `JwtAuthGuard` global con decorador `@Public()`.
@@ -129,6 +137,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: refresh tokens completos.
 
 **Hacer**:
+
 - Entity `RefreshToken` y migración.
 - `POST /auth/refresh` con rotación.
 - `POST /auth/logout` y `POST /auth/logout-all`.
@@ -144,6 +153,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: ninguna query toca DB sin `tenant_id` filtrado.
 
 **Hacer**:
+
 - `TenantGuard` global que valida `x-tenant-slug` vs JWT.
 - Decorador `@TenantId()`.
 - Clase base `TenantScopedRepository<T>` que rechaza queries sin tenant_id (al menos los métodos comunes: find, findOne, count, update, delete).
@@ -158,6 +168,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: control de acceso por rol.
 
 **Hacer**:
+
 - Decorador `@Roles('OWNER', 'TRAINER', 'STUDENT')`.
 - `RolesGuard` global.
 - Endpoint dummy protegido por rol para test.
@@ -171,6 +182,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: OWNER crea trainers, TRAINER crea students.
 
 **Hacer**:
+
 - `POST /users` (OWNER → puede crear TRAINER y STUDENT; TRAINER → solo STUDENT bajo su `trainer_id`).
 - `GET /users` con filtros (`role`, `isActive`, paginación).
 - `PATCH /users/:id` (cambiar nombre, `isActive`).
@@ -187,6 +199,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: ejercicios del tenant.
 
 **Hacer**:
+
 - Entity + migración.
 - CRUD completo. Solo OWNER y TRAINER pueden crear/editar/borrar. STUDENT puede leer.
 - Validación de URL de media.
@@ -201,6 +214,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: subir gifs/videos de ejercicios a Cloudflare R2.
 
 **Hacer**:
+
 - Bucket en R2 (manual, una vez). Credenciales en env.
 - `POST /media/upload-url` que devuelve una presigned URL para PUT directo desde el cliente.
 - `POST /media/confirm` para asociar el archivo subido a un exercise.
@@ -216,6 +230,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: armar rutinas con ejercicios ordenados.
 
 **Hacer**:
+
 - Entities + migración.
 - `POST /routines` con items embebidos.
 - `PATCH /routines/:id` (reordenar items, agregar, quitar).
@@ -230,6 +245,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: vincular rutina con alumno.
 
 **Hacer**:
+
 - Entity `Assignment` + migración.
 - `POST /routines/:id/assignments` con `studentId`, `startsOn`, `endsOn?`, `weekdayMask`.
 - `GET /students/:id/assignments` (activas y vencidas).
@@ -244,6 +260,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: el alumno ejecuta una rutina.
 
 **Hacer**:
+
 - Entities `Session`, `Set` + migración.
 - `GET /sessions/today` (STUDENT): resuelve qué asignación aplica hoy.
 - `POST /sessions` (STUDENT): inicia sesión, snapshot de rutina.
@@ -260,6 +277,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: derivar y consultar PRs.
 
 **Hacer**:
+
 - Entity `PersonalRecord` + migración.
 - Cálculo dentro de la transacción de "POST /sets": si supera, upsert.
 - `GET /students/:id/personal-records` y `GET /students/:id/personal-records/:exerciseId`.
@@ -273,6 +291,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: comentarios del alumno en ejercicios/sesiones.
 
 **Hacer**:
+
 - Entity + migración.
 - `POST /comments`, `GET /comments` filtrable.
 - Solo el dueño puede borrar el suyo.
@@ -288,6 +307,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: middleware de subdominios, layouts de las 3 superficies, shadcn instalado.
 
 **Hacer**:
+
 - `middleware.ts` con detección de host (ver `docs/03-multi-tenancy.md`).
 - Route groups `(marketing)`, `(admin)`, `(student)` con layouts placeholder.
 - shadcn/ui inicializado.
@@ -303,6 +323,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: login y refresh silencioso.
 
 **Hacer**:
+
 - Store de auth con Zustand (access token en memoria).
 - `useAuth()` hook.
 - Páginas: `/(marketing)/signup`, `/(admin)/login`, `/(student)/login`.
@@ -318,6 +339,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: OWNER/TRAINER ven y gestionan alumnos.
 
 **Hacer**:
+
 - `/(admin)/students` con lista paginada.
 - `/(admin)/students/new` con form.
 - `/(admin)/students/:id` con detalle y toggle activo/inactivo.
@@ -331,6 +353,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: CRUD desde frontend.
 
 **Hacer**:
+
 - `/(admin)/exercises` lista, crear, editar.
 - Subida de media con presigned URL (step 14).
 - `/(admin)/routines` lista, builder con drag&drop de items.
@@ -344,6 +367,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: asignar rutina a alumno desde UI.
 
 **Hacer**:
+
 - En `/(admin)/students/:id`, tab "Rutinas".
 - Picker de rutina + fechas + días de la semana.
 
@@ -356,6 +380,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: alumno entra, ve la rutina del día, la ejecuta.
 
 **Hacer**:
+
 - `/(student)/` home con "Hoy".
 - Tap en ejercicio → vista de detalle con video/gif, descripción.
 - Tracking de sets inline.
@@ -371,6 +396,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: el alumno ve su progreso.
 
 **Hacer**:
+
 - `/(student)/history` con sesiones pasadas.
 - `/(student)/exercises/:id` con histórico por ejercicio y PR.
 
@@ -385,6 +411,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: producción mínima.
 
 **Hacer**:
+
 - DNS con wildcard.
 - API en Railway o Fly.
 - Web en Vercel.
@@ -402,6 +429,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Objetivo**: saber cuándo algo se rompe.
 
 **Hacer**:
+
 - Sentry free tier en api y web.
 - Healthcheck endpoint público.
 - Uptime monitor gratis (Better Stack / UptimeRobot).

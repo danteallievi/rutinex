@@ -93,6 +93,7 @@ const routines = await apiClient.get<RoutineResponseDto[]>('/routines');
 ```
 
 El cliente:
+
 - Adjunta `Authorization: Bearer <accessToken>` desde el store de auth.
 - Adjunta `x-tenant-slug` desde el contexto de tenant (en surfaces de admin y student).
 - Maneja 401 automáticamente: intenta refresh, si falla → logout + redirect a login.
@@ -144,6 +145,7 @@ El cliente:
 ## Loading / Error / Empty states
 
 Cada vista de lista o detalle debe contemplar:
+
 1. Loading (skeleton, no spinner full-screen).
 2. Error (componente `<ErrorState />` con retry).
 3. Empty (componente `<EmptyState />` con CTA contextual).

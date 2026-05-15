@@ -16,21 +16,22 @@ Antes de tocar código, leé las docs relevantes a la tarea. La fuente de verdad
 
 Mapa rápido:
 
-| Si vas a tocar...                          | Leé primero...                          |
-|--------------------------------------------|-----------------------------------------|
-| Entidades, relaciones, schema de DB        | `docs/02-dominio.md`                    |
-| Auth, login, JWT, registro                 | `docs/04-auth.md`                       |
-| Resolución de tenant, subdominio, branding | `docs/03-multi-tenancy.md`              |
-| Endpoints, DTOs, validación, errores       | `docs/05-api-conventions.md`            |
-| Componentes, páginas, estado en Next       | `docs/06-frontend-conventions.md`       |
+| Si vas a tocar...                          | Leé primero...                               |
+| ------------------------------------------ | -------------------------------------------- |
+| Entidades, relaciones, schema de DB        | `docs/02-dominio.md`                         |
+| Auth, login, JWT, registro                 | `docs/04-auth.md`                            |
+| Resolución de tenant, subdominio, branding | `docs/03-multi-tenancy.md`                   |
+| Endpoints, DTOs, validación, errores       | `docs/05-api-conventions.md`                 |
+| Componentes, páginas, estado en Next       | `docs/06-frontend-conventions.md`            |
 | Qué hacer ahora / qué sigue                | `docs/07-roadmap.md` y `docs/09-progreso.md` |
-| Por qué se decidió X de tal forma          | `docs/08-decisiones.md`                 |
+| Por qué se decidió X de tal forma          | `docs/08-decisiones.md`                      |
 
 ### 2. Auto-documentación
 
 Este repo se auto-documenta. Cada tipo de cambio dispara una actualización de documentación específica. Las reglas viven en `docs/00-autodocumentacion.md`. **Leelas. No son opcionales.**
 
 Resumen:
+
 - Agregás/modificás una entidad → actualizá `docs/02-dominio.md`
 - Tomás una decisión arquitectónica → agregá un ADR en `docs/08-decisiones.md`
 - Cerrás un paso del roadmap → marcalo en `docs/09-progreso.md`

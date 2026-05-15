@@ -14,11 +14,6 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "declaration": true,
-    "sourceMap": true,
-    "baseUrl": ".",
-    "paths": {
-      "@rutinex/shared-types": ["packages/shared-types/src/index.ts"],
-      "@rutinex/shared-types/*": ["packages/shared-types/src/*"]
-    }
+    "sourceMap": true
   }
 }

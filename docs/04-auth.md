@@ -10,16 +10,16 @@
 
 ## Endpoints
 
-| Endpoint                          | Auth   | Descripción                                       |
-|-----------------------------------|--------|---------------------------------------------------|
-| `POST /auth/signup`               | -      | Solo para OWNER + tenant. Crea tenant y user OWNER. |
-| `POST /auth/login`                | -      | Email + password (+ slug si ambigüedad). Devuelve access + refresh. |
-| `POST /auth/refresh`              | -      | Refresh token. Rota el refresh y devuelve par nuevo. |
-| `POST /auth/logout`               | bearer | Revoca el refresh token actual.                   |
-| `POST /auth/logout-all`           | bearer | Revoca todos los refresh del usuario.             |
-| `POST /auth/password-reset`       | -      | Inicia flujo. Manda email con token (fase 2).     |
-| `POST /auth/password-reset/confirm` | -    | Confirma con token + nueva password.              |
-| `POST /auth/change-password`      | bearer | Cambio voluntario, requiere password actual.       |
+| Endpoint                            | Auth   | Descripción                                                         |
+| ----------------------------------- | ------ | ------------------------------------------------------------------- |
+| `POST /auth/signup`                 | -      | Solo para OWNER + tenant. Crea tenant y user OWNER.                 |
+| `POST /auth/login`                  | -      | Email + password (+ slug si ambigüedad). Devuelve access + refresh. |
+| `POST /auth/refresh`                | -      | Refresh token. Rota el refresh y devuelve par nuevo.                |
+| `POST /auth/logout`                 | bearer | Revoca el refresh token actual.                                     |
+| `POST /auth/logout-all`             | bearer | Revoca todos los refresh del usuario.                               |
+| `POST /auth/password-reset`         | -      | Inicia flujo. Manda email con token (fase 2).                       |
+| `POST /auth/password-reset/confirm` | -      | Confirma con token + nueva password.                                |
+| `POST /auth/change-password`        | bearer | Cambio voluntario, requiere password actual.                        |
 
 ## Modelo de tokens
 
@@ -45,18 +45,18 @@ Firmado con HS256 y secret de env (`JWT_ACCESS_SECRET`). El secret se rota cada 
 
 **Tabla `refresh_tokens`**:
 
-| Campo           | Tipo         | Notas                                          |
-|-----------------|--------------|------------------------------------------------|
-| `id`            | uuid PK      |                                                |
-| `tenant_id`     | uuid FK      |                                                |
-| `user_id`       | uuid FK      | Index.                                         |
-| `token_hash`    | varchar(64)  | SHA-256 hex.                                   |
-| `expires_at`    | timestamptz  |                                                |
-| `revoked_at`    | timestamptz  | Nullable.                                      |
-| `replaced_by`   | uuid FK self | Si se rotó, apunta al token nuevo.             |
-| `user_agent`    | varchar      | Para que el user pueda ver "Mis sesiones".     |
-| `ip`            | varchar      |                                                |
-| `created_at`    | timestamptz  |                                                |
+| Campo         | Tipo         | Notas                                      |
+| ------------- | ------------ | ------------------------------------------ |
+| `id`          | uuid PK      |                                            |
+| `tenant_id`   | uuid FK      |                                            |
+| `user_id`     | uuid FK      | Index.                                     |
+| `token_hash`  | varchar(64)  | SHA-256 hex.                               |
+| `expires_at`  | timestamptz  |                                            |
+| `revoked_at`  | timestamptz  | Nullable.                                  |
+| `replaced_by` | uuid FK self | Si se rotó, apunta al token nuevo.         |
+| `user_agent`  | varchar      | Para que el user pueda ver "Mis sesiones". |
+| `ip`          | varchar      |                                            |
+| `created_at`  | timestamptz  |                                            |
 
 ## Flujos
 
@@ -102,14 +102,14 @@ Firmado con HS256 y secret de env (`JWT_ACCESS_SECRET`). El secret se rota cada 
 
 Vienen del módulo `auth`. Resumen:
 
-| Decorador / Guard          | Para qué                                                              |
-|----------------------------|------------------------------------------------------------------------|
-| `@Public()`                | Marca endpoints sin auth. (El JWT guard global skipea estos.)         |
-| `JwtAuthGuard` (global)    | Valida access token y popula `req.user`.                              |
-| `RolesGuard`               | Junto con `@Roles('OWNER')` o `@Roles('TRAINER', 'OWNER')`.            |
-| `TenantGuard` (global)     | Valida que el `x-tenant-slug` (si vino) coincida con el JWT.          |
-| `@CurrentUser()`           | Inyecta el user actual en el handler.                                  |
-| `@TenantId()`              | Inyecta el `tenantId` actual.                                          |
+| Decorador / Guard       | Para qué                                                      |
+| ----------------------- | ------------------------------------------------------------- |
+| `@Public()`             | Marca endpoints sin auth. (El JWT guard global skipea estos.) |
+| `JwtAuthGuard` (global) | Valida access token y popula `req.user`.                      |
+| `RolesGuard`            | Junto con `@Roles('OWNER')` o `@Roles('TRAINER', 'OWNER')`.   |
+| `TenantGuard` (global)  | Valida que el `x-tenant-slug` (si vino) coincida con el JWT.  |
+| `@CurrentUser()`        | Inyecta el user actual en el handler.                         |
+| `@TenantId()`           | Inyecta el `tenantId` actual.                                 |
 
 Orden de guards: `JwtAuthGuard` → `TenantGuard` → `RolesGuard`.
 

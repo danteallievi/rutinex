@@ -6,7 +6,8 @@
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint .",
+    "format": "prettier --write \"app/**/*.{ts,tsx,css}\""
   },
   "dependencies": {
     "react": "19.1.0",

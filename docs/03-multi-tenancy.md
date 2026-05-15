@@ -13,6 +13,7 @@ Por qué no schema-per-tenant o DB-per-tenant: para arrancar es caro de operar, 
 ### DNS
 
 Wildcard A record:
+
 ```
 *.rutinex.app  →  Vercel
 api.rutinex.app  →  Railway/Fly
