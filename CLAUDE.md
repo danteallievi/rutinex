@@ -57,6 +57,7 @@ El roadmap (`docs/07-roadmap.md`) está dividido en pasos numerados. Cada paso t
 Las convenciones completas viven en `docs/05-api-conventions.md` y `docs/06-frontend-conventions.md`. Resumen mínimo:
 
 - **TypeScript estricto** en todo el monorepo. `strict: true`, `noUncheckedIndexedAccess: true`.
+- **Lint y formato**: ESLint flat config en `eslint.config.mjs` (raíz) y Prettier en `.prettierrc`. `pnpm lint` y `pnpm format` corren desde la raíz; el pre-commit hook (husky + lint-staged) autoformatea los archivos staged. No bypassees el hook con `--no-verify`.
 - **Validación**: en el API, `class-validator` + `class-transformer` en todos los DTOs.
 - **Errores**: usar las excepciones de NestJS (`NotFoundException`, etc.) y dejar que el filtro global las formatee.
 - **Naming**: `kebab-case` para archivos y carpetas, `PascalCase` para clases/componentes, `camelCase` para variables/funciones.
