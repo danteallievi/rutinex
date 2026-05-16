@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rutinex-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rutinex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rutinex}
+      POSTGRES_DB: ${POSTGRES_DB:-rutinex}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - rutinex-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U ${POSTGRES_USER:-rutinex} -d ${POSTGRES_DB:-rutinex}',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  rutinex-postgres-data:
+    name: rutinex-postgres-data

@@ -12,6 +12,8 @@
     "api:dev": "pnpm --filter @rutinex/api start:dev",
     "web:dev": "pnpm --filter @rutinex/web dev",
     "build": "pnpm -r build",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

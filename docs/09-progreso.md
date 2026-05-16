@@ -4,9 +4,9 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 
 ## Estado general
 
-**Fase actual**: Fase 0 — Setup del repo.
-**Paso actual**: Step 2 completo. Próximo: Step 3 — Conexión a DB + primera entity.
-**Última actualización**: 2026-05-14 — Step 2 (linting, formatting, hooks) completado.
+**Fase actual**: Fase 1 — Backend foundations.
+**Paso actual**: Step 3 completo. Próximo: Step 4 — Módulo Tenants + resolución por slug.
+**Última actualización**: 2026-05-16 — Step 3 (DB + entity `Tenant`) completado.
 
 ## Pasos completados
 
@@ -40,9 +40,38 @@ Notas:
 - Verificación del hook: se commiteó un archivo deformado (`apps/api/src/_lint_probe.ts` con `"deformed"` y espacios sueltos) y lint-staged lo reformateó a `'deformed'` con semi-colon antes de quedar incluido en el commit. Después se descartó el commit de prueba.
 - Limpieza de deuda: se quitaron `baseUrl` (y `paths` no usados) de `tsconfig.base.json` y `apps/api/tsconfig.json` (deuda heredada de `nest new`).
 
+### Step 3 — Conexión a DB + primera entity (2026-05-16)
+
+Postgres 16 corriendo en Docker vía `docker-compose.yml` en la raíz. `pnpm db:up` / `pnpm db:down` desde raíz (y desde `apps/api`) lo levantan/bajan. Conexión por `DATABASE_URL` (Postgres en `localhost:5432` con user/password/db `rutinex` en dev).
+
+TypeORM 0.3 cableado en NestJS: `apps/api/src/config/database.ts` construye las options desde env y las consumen tanto `TypeOrmModule.forRootAsync` (runtime) como `apps/api/src/data-source.ts` (CLI de migraciones). `synchronize: false` siempre (ADR-005). `entities` y `migrations` se cargan por glob desde `src/modules/**/*.entity.ts` y `src/migrations/*.ts`.
+
+Entity `Tenant` en `apps/api/src/modules/tenants/entities/tenant.entity.ts`: `id` (uuid, default `uuid_generate_v4()`), `slug` (varchar(63) único), `name` (varchar(255)), `branding` (jsonb, default `{}`), `is_active` (bool, default true), `created_at`/`updated_at` (timestamptz). El campo `subscription_status` queda diferido a Fase 2 (sigue documentado en `docs/02-dominio.md`).
+
+Migración inicial: `apps/api/src/migrations/1778944394598-InitTenants.ts`. Habilita la extensión `uuid-ossp` (requerida por `uuid_generate_v4()`), crea la tabla y el índice único `uq_tenants_slug`. Up/down testeados (revert + re-run dejan el estado limpio).
+
+Scripts:
+
+- Raíz: `pnpm db:up`, `pnpm db:down` (`docker compose up -d postgres` / `down`).
+- `apps/api`: `db:up`, `db:down` (mismo compose vía `-f ../../docker-compose.yml`), `typeorm` (wrapper de `typeorm-ts-node-commonjs -d src/data-source.ts`), `migration:generate`, `migration:run`, `migration:revert`, `db:smoke` (script `src/scripts/smoke-tenants.ts` que abre conexión y exige que `tenants` exista con 0 filas).
+
+`.env.example`:
+
+- Raíz: vars `POSTGRES_*` que consume docker-compose.
+- `apps/api/.env.example`: `PORT`, `DATABASE_URL`, `DATABASE_LOGGING`.
+
+Archivos clave: `docker-compose.yml`, `.env.example`, `apps/api/.env.example`, `apps/api/src/config/database.ts`, `apps/api/src/data-source.ts`, `apps/api/src/modules/tenants/entities/tenant.entity.ts`, `apps/api/src/migrations/1778944394598-InitTenants.ts`, `apps/api/src/scripts/smoke-tenants.ts`, scripts nuevos en `package.json` raíz y `apps/api/package.json`.
+
+Notas:
+
+- TypeORM CLI exige que `data-source.ts` exporte una sola `DataSource` (default export); con doble export (`export const` + `export default`) tira "must contain only one export of DataSource instance".
+- El CLI `typeorm-ts-node-commonjs` funciona con `module: nodenext` en el tsconfig porque `apps/api/package.json` no declara `type: module`, así que Node interpreta los archivos como CJS.
+- El smoke script usa `Logger` de `@nestjs/common` (sin `console.log`) para alinear con CLAUDE.md.
+- `pg_isready` del healthcheck del compose evita carreras al correr migraciones inmediatamente después de `db:up`.
+
 ## Próxima acción concreta
 
-Step 3 — Conexión a DB + primera entity. Criterios y detalle en `docs/07-roadmap.md`.
+Step 4 — Módulo Tenants + resolución por slug. Criterios y detalle en `docs/07-roadmap.md`.
 
 ## Pendientes / deudas técnicas
 
