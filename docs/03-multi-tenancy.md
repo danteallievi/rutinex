@@ -111,10 +111,12 @@ Tailwind se configura para leer esas variables (`tailwind.config.ts` extends con
 
 ## Slug del tenant
 
-- Match: `^[a-z0-9](-[a-z0-9]+)*$` (DNS-safe).
-- Mínimo 3 caracteres, máximo 30.
-- Reservados: `www`, `api`, `app`, `admin`, `mail`, `assets`, `static`, `rutinex`, `support`, `help`, `docs`, `status`. Se rechazan en signup.
+- Match: `^[a-z0-9]+(-[a-z0-9]+)*$` (DNS-safe).
+- Mínimo 3 caracteres, máximo 63 (DNS label max). El entity (`apps/api/src/modules/tenants/entities/tenant.entity.ts`) usa `varchar(63)`.
+- Reservados (chocan con superficies propias del producto y se rechazan en `POST /tenants` con 409 `SLUG_RESERVED`):
+  `admin`, `api`, `app`, `assets`, `auth`, `docs`, `help`, `mail`, `rutinex`, `static`, `status`, `support`, `www`.
 - Inmutable después de creado. Si un cliente lo quiere cambiar, soporte lo hace manualmente y vemos cómo migrar referencias (rarísimo).
+- Fuente de verdad en código: `apps/api/src/modules/tenants/slug.ts` (constantes + función `isReservedSlug`). El DTO valida regex + longitud (400) y el service valida reservado + colisión (409).
 
 ## Casos borde
 

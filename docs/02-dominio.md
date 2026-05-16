@@ -214,7 +214,7 @@ personal_records >── exercises, sets
 ### F1 — Onboarding de tenant + OWNER
 
 1. OWNER se registra desde landing pública (`rutinex.app/signup`): nombre del gym, slug deseado, email, password.
-2. API valida que el slug no esté tomado y matchee `^[a-z0-9](-?[a-z0-9])*$`.
+2. API valida que el slug matchee las reglas de `docs/03-multi-tenancy.md` (regex, longitud, no reservado) y que no esté tomado.
 3. Se crea `tenant` (status `trial`) + `user` con role `OWNER`.
 4. Email de confirmación (fase 2).
 5. OWNER puede ya entrar a `<slug>.rutinex.app/admin`.

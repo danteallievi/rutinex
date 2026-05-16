@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 3 completo. Próximo: Step 4 — Módulo Tenants + resolución por slug.
-**Última actualización**: 2026-05-16 — Step 3 (DB + entity `Tenant`) completado.
+**Paso actual**: Step 4 completo. Próximo: Step 5 — Entity User + módulo Users.
+**Última actualización**: 2026-05-16 — Step 4 (módulo Tenants + resolución por slug) completado.
 
 ## Pasos completados
 
@@ -69,9 +69,39 @@ Notas:
 - El smoke script usa `Logger` de `@nestjs/common` (sin `console.log`) para alinear con CLAUDE.md.
 - `pg_isready` del healthcheck del compose evita carreras al correr migraciones inmediatamente después de `db:up`.
 
+### Step 4 — Módulo Tenants + resolución por slug (2026-05-16)
+
+`TenantsModule` en `apps/api/src/modules/tenants/` con:
+
+- `TenantsService` con `create(dto)` y `findBySlug(slug)`. Tira `ConflictException` con `code: 'SLUG_RESERVED' | 'SLUG_TAKEN'` (409) y `NotFoundException` con `code: 'TENANT_NOT_FOUND'` (404). `findBySlug` también devuelve 404 si `is_active=false` (no filtra existencia, ver `docs/03-multi-tenancy.md`).
+- `TenantsController` expone `POST /tenants` (público; lo va a usar signup en Step 7) y `GET /tenants/by-slug/:slug` (devuelve solo `{ id, slug, name, branding }`).
+- DTOs con `class-validator`: `CreateTenantDto` valida slug (regex + longitud 3–63), name (1–255) y `BrandingDto` opcional (`primaryColor`, `accentColor`, `logoUrl`).
+- Reservados y reglas de slug en `apps/api/src/modules/tenants/slug.ts` (`SLUG_REGEX`, `SLUG_MIN_LENGTH`, `SLUG_MAX_LENGTH`, `RESERVED_SLUGS`). Sincronizado con `docs/03-multi-tenancy.md`.
+
+Pipes/filters globales vía providers en `AppModule` (para que el `TestingModule` los herede sin tocar `main.ts`):
+
+- `APP_PIPE` → `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })`.
+- `APP_FILTER` → `HttpExceptionFilter` en `apps/api/src/common/filters/http-exception.filter.ts`. Agrega `timestamp` + `path` y propaga `code` cuando el throw fue `new ConflictException({ code, message })`. Shape estándar de `docs/05-api-conventions.md`.
+
+Tests:
+
+- `tenants.service.spec.ts` (unit, repo mockeado): create OK, create con branding, rechaza reservado, rechaza duplicado, findBySlug OK, findBySlug 404 inexistente, findBySlug 404 cuando `isActive=false`.
+- `test/tenants.e2e-spec.ts` (e2e contra Postgres local, `TRUNCATE TABLE tenants CASCADE` en cada `beforeEach`): POST 201 mínimo, POST 201 con branding + `forbidNonWhitelisted`, POST 409 reservado, POST 409 duplicado, POST 400 regex inválido, POST 400 muy corto, POST 400 faltan campos, POST 400 propiedad no whitelisteada, GET 200 por slug, GET 404 inexistente, GET 404 cuando `is_active=false`.
+- `test/jest-e2e.json` ahora carga `dotenv/config` en `setupFiles` para que `AppModule` resuelva `DATABASE_URL`.
+
+Archivos clave: `apps/api/src/modules/tenants/{tenants.module,tenants.service,tenants.controller,slug}.ts`, `apps/api/src/modules/tenants/dto/{create-tenant,branding}.dto.ts`, `apps/api/src/modules/tenants/tenants.service.spec.ts`, `apps/api/src/common/filters/http-exception.filter.ts`, `apps/api/src/app.module.ts`, `apps/api/test/tenants.e2e-spec.ts`, `apps/api/test/jest-e2e.json`.
+
+Notas:
+
+- El regex de slug en `docs/03-multi-tenancy.md` estaba mal: `^[a-z0-9](-[a-z0-9]+)*$` exigía que sólo el primer carácter fuese alfanumérico antes de un hyphen-group, lo que rechazaba slugs sin guiones como `olimpo`. Quedó corregido a `^[a-z0-9]+(-[a-z0-9]+)*$` (uno o más alnum, seguido de cero o más grupos `-<alnum>+`).
+- La doc decía longitud máxima 30, pero el entity ya usa `varchar(63)` (DNS label max). Alineamos la doc a 63.
+- Se agregó `auth` a la lista de reservados respecto a la doc original.
+- Nuevo shape de error de negocio: `ConflictException({ code: 'SLUG_RESERVED' | 'SLUG_TAKEN', message })` y `NotFoundException({ code: 'TENANT_NOT_FOUND', message })`. El filtro preserva el `code` en el body.
+- El `app.e2e-spec.ts` pasó de `beforeEach` a `beforeAll` + `afterAll(app.close())` para evitar el warning "worker process failed to exit gracefully".
+
 ## Próxima acción concreta
 
-Step 4 — Módulo Tenants + resolución por slug. Criterios y detalle en `docs/07-roadmap.md`.
+Step 5 — Entity User + módulo Users. Criterios y detalle en `docs/07-roadmap.md`.
 
 ## Pendientes / deudas técnicas
 
