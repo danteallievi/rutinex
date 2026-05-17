@@ -48,7 +48,17 @@ El roadmap (`docs/07-roadmap.md`) está dividido en pasos numerados. Cada paso t
 5. Verificá los criterios de aceptación.
 6. Actualizá `docs/09-progreso.md` marcando el paso como completo y, si corresponde, agregá un ADR en `docs/08-decisiones.md`.
 7. Hacé commit con mensaje `step(N): descripción corta`.
-8. Pausá y avisame el resultado antes de seguir con el próximo paso.
+8. Pausá y avisame el resultado antes de seguir con el próximo paso, usando el **formato de cierre de step** (abajo).
+
+### Formato de cierre de step
+
+Al terminar el commit del step, respondé breve y conciso, en tres secciones:
+
+1. **Resumen** — 1-3 líneas de qué quedó hecho (el detalle largo vive en `docs/09-progreso.md`, no lo repitas acá).
+2. **Visible en la web** — qué puede ver el usuario navegando la web (`pnpm web:dev`). Si el step es backend puro y no hay nada nuevo visible, decilo explícito ("nada nuevo — backend puro").
+3. **Prompt para la próxima sesión** — un bloque listo para copiar/pegar que arranque el siguiente step: orden de docs a leer, criterios de aceptación clave, y cualquier regla específica de ese step.
+
+Nada más. Sin "qué aprendí", sin re-explicar el plan, sin pedir confirmación. El usuario corta o sigue.
 
 **Importante**: si los tokens se están por acabar a mitad de un paso, dejá `docs/09-progreso.md` en un estado que describa exactamente qué quedó hecho y qué falta. La próxima sesión tiene que poder retomar leyendo ese archivo.
 
