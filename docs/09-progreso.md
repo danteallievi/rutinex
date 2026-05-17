@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 7 completo. Próximo: Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive.
-**Última actualización**: 2026-05-17 — Step 7 (superadmin seed CLI + login + SuperadminGuard).
+**Paso actual**: Step 7.5 completo (sprint visual descartable encima del Step 7). Próximo: Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive.
+**Última actualización**: 2026-05-17 — Step 7.5 (sprint visual multi-surface: landing comercial, admin mockup, student mockup, superadmin mockup).
 
 ## Cambios de doc
 
@@ -243,9 +243,75 @@ Notas:
 - El `INVALID_CREDENTIALS` 401 cubre tres casos (host inválido, user inexistente, password incorrecta). Ningún caller necesita distinguirlos — el frontend muestra el mismo mensaje "Email o contraseña inválidos."
 - La password mínima en el CLI es 12 chars. En `change-password` (Step 8) habrá una política de fortaleza pública; por ahora 12 es un default razonable para no exponer al bootstrap a passwords débiles.
 
+### Step 7.5 — Sprint visual multi-surface (interludio, 2026-05-17)
+
+Material de venta navegable para demos comerciales. **Frontend puro, datos fake, descartable**: los mockups se reemplazan por implementaciones reales en Steps 21-28 — sirven como referencia visual, no se promete que el código sobreviva. No toca backend ni docs de dominio. Fuera de la numeración del roadmap (mismo patrón que Step 4.5).
+
+Estructura: 4 sub-agentes paralelos (uno por surface, sin colisión de archivos), orquestados por el thread principal (mock data compartida + validación + commit único). Patrón de ADR-015.
+
+**Setup (Agente A)**:
+
+- `shadcn/ui` inicializado (`pnpm dlx shadcn@latest init` con preset `base-nova` — base-ui en lugar de radix; los componentes Tailwind 4 funcionan igual). `apps/web/components.json`, `apps/web/lib/utils.ts`, y `apps/web/components/ui/{button,card,badge,dialog,input,label,sheet,table,sonner}.tsx` generados. `sonner` reemplaza `toast` (no existe en `base-nova`).
+- `apps/web/app/globals.css`: integra las CSS vars que necesita shadcn (`--card`, `--primary`, `--ring`, etc.) preservando las nuestras (`--background`, `--foreground`, `--brand-primary`, etc.). `--primary` y `--ring` se setean al naranja del proyecto (`#f97316`) para que los componentes shadcn respeten el accent sin variants custom.
+- Landing comercial sales-led en `apps/web/app/page.tsx`: hero "Tu gimnasio, tu marca, tu plataforma", 4 beneficios, sección "cómo funciona", 3 tiers (Solo USD 19 / Equipo USD 49 / Red a medida), todos los CTA apuntan a `https://wa.me/${env.contactWhatsapp}` (`target="_blank" rel="noopener noreferrer"`). Server Component, mobile-first, estética editorial dark con halo radial naranja. `apps/web/app/signup-form.tsx` **borrado** (sales-led, ya no aplica).
+- `apps/web/middleware.ts`: chequea `isSuperadminHost` antes que tenant; `superadmin.*` rewrite a `/superadmin/...`. Mantenido el rewrite de tenant (`<slug>.*` → `/t/<slug>/...`).
+- `apps/web/lib/subdomain.ts`: `RESERVED_HOST_PREFIXES = {'www','superadmin'}` (saqué `app` por ADR-012). Agregado `isSuperadminHost(host)`.
+- `apps/web/lib/env.ts`: agregado `contactWhatsapp` (required, `NEXT_PUBLIC_CONTACT_WHATSAPP`). `.env.example` + `.env` con placeholder `5491100000000`.
+- `apps/web/lib/mock-data.ts`: contrato compartido por los 4 agentes. Tipos (`MockTenant`, `MockUser`, `MockExercise`, `MockRoutineItem`, `MockRoutine`, `MockSession`, `MockSet`) + arrays (1 owner, 3 trainers, 14 alumnos del tenant `olimpo`; 8-10 tenants en `mockTenants`; 12 ejercicios; 4 rutinas; 4 sesiones; 16 sets). IDs cortos legibles (`u-student-1`, `ex-bench-press`, etc.) para facilitar debugging. Helpers `getStudentById`, `getExerciseById`, `getRoutineById`, `getRoutineForStudentToday`, `getStudentsByTrainerId`.
+- `apps/web/app/t/[slug]/page.tsx`: reemplazado por **selector demo** con dos cards "Ver como admin" / "Ver como alumno" (link a `/admin` y `/student`). Aplica branding del tenant; try/catch sobre `getTenantBySlug` con fallback a `olimpoTenant` del mock para que el demo no rompa si el API está caído.
+
+**Admin mockup (Agente B)** — `apps/web/app/t/[slug]/(admin)/admin/...`:
+
+- `(admin)/layout.tsx`: sidebar fija desktop + topbar mobile con drawer (single `'use client'` aislado en `_components/admin-mobile-nav.tsx`). Branding del tenant (CSS vars en el wrapper alto). Nav: Dashboard, Alumnos, Rutinas (próximamente), Ejercicios (próximamente). Footer con `olimpoOwner`.
+- `admin/page.tsx`: dashboard con 4 stat cards (activos / sesiones 7d / pendientes / sin actividad) + bitácora de últimas 5 sesiones con badges Completa/En curso.
+- `admin/students/page.tsx`: tabla desktop (`≥md`) + lista de cards mobile. Buscador placeholder + segmented control "Todos/Activos/Inactivos" (visual). Cada fila linkea a `/admin/students/[id]`.
+- `admin/students/[id]/page.tsx`: header con avatar grande + DNI + estado; info card lateral (email, trainer, alta, último ingreso); tabs visuales (Rutinas activa, las otras placeholder); rutina renderizada con 5 ejercicios resueltos vía `getExerciseById`.
+- Estética: editorial-precision dark, hairlines, micro-tipografía mono uppercase para labels, números tabulares, naranja reservado para acentos.
+
+**Student mockup (Agente C)** — `apps/web/app/t/[slug]/(student)/student/...`:
+
+- `(student)/layout.tsx`: header sticky desktop con tabs + bottom nav mobile (`_components/student-bottom-nav.tsx`, único `'use client'`, usa `usePathname` para active state). Tap targets ≥64px, `safe-area-inset-bottom`.
+- `student/page.tsx`: home "Hoy" con saludo + fecha + card grande de la sesión del día (flip de contraste `bg-foreground`/`text-background` para hacerla focal); lista de 5 ejercicios checkeables con link al detalle; botón gigante "Completar sesión"; sección "Próximas sesiones".
+- `student/exercises/[id]/page.tsx`: hero con título + chips de músculos + placeholder de video (gradiente con `color-mix(in srgb, var(--brand-primary)...)` + grid texture); descripción; tabla de sets editables (`<input type="number">` con `defaultValue`, sin lógica); botón "Guardar y volver".
+- Estética: hermana del admin pero más bold y energética. Display ultra-bold tracking-tight; numerales `tabular-nums` para sets/reps; CTA estilo "botón de gimnasio premium" con uppercase + tracking + color brand.
+
+**Superadmin mockup (Agente D)** — `apps/web/app/superadmin/...`:
+
+- `layout.tsx`: header sticky con brandmark "R", badge `internal` con dot incandescente, perfil del operador + botón "Salir". Topbar horizontal con `Tenants` (activo), `Operadores`/`Auditoría`/`Configuración` (disabled, marcados `soon`). Status pill `api · ok / db · ok` en desktop. Fondo `#070707` (más oscuro que `--background`) para separar este surface del de tenant.
+- `page.tsx`: `redirect('/superadmin/tenants')`.
+- `tenants/page.tsx`: header con breadcrumb mono + contadores activos/inactivos + CTAs "Exportar CSV" y "+ Nuevo tenant"; toolbar con buscador (`kbd "/"`) + tabs segmentadas + contador "Mostrando N de total"; tabla densa de 7 columnas (slug mono con dot brand, nombre + UUID, badge estado, alumnos/trainers `tabular-nums`, creado en dos líneas, acciones Ver/Reset OWNER/toggle). Mobile: cards apiladas con stat-grid. Hover muestra franja lateral con el color de branding del tenant.
+
+**Decisiones operativas (orquestación)**:
+
+- Route groups + subprefijo URL para evitar colisión: `(admin)/admin/...` y `(student)/student/...` conviven dentro de `app/t/[slug]/` porque las URLs efectivas son `/admin` y `/student`, no `/`. Si los dos route groups hubieran tenido `page.tsx` en su raíz, Next habría tirado conflicto.
+- Mock data primero: el contrato de `lib/mock-data.ts` se definió upfront en el prompt de cada agente, así los 4 pudieron correr en paralelo (B/C/D imports al contrato, A genera el archivo).
+- Fixes manuales del thread principal post-merge: 1 type error (`InfoRow value` esperaba `string` y `student.email` es `string | null` — coalescing a `'sin email'`); 4 archivos con drift de Prettier (auto-fix vía `pnpm lint:fix`).
+
+**Verificación**:
+
+- `pnpm lint` clean. `pnpm format:check` clean.
+- `pnpm --filter @rutinex/web exec tsc --noEmit` clean.
+- `pnpm --filter @rutinex/web build` compila todas las rutas:
+  - Estáticas: `/`, `/superadmin`, `/superadmin/tenants`.
+  - Dinámicas: `/t/[slug]`, `/t/[slug]/admin`, `/t/[slug]/admin/students`, `/t/[slug]/admin/students/[id]`, `/t/[slug]/student`, `/t/[slug]/student/exercises/[id]`.
+- Smoke del middleware con `curl` + `Host:` header:
+  - `localhost:3000/` → 200 (landing).
+  - `superadmin.localhost:3000/` → 307 → `/superadmin/tenants` 200.
+  - `olimpo.localhost:3000/` → 200 (selector demo, fallback a mock cuando API no responde con un tenant `olimpo`).
+  - `olimpo.localhost:3000/admin` → 200 (dashboard).
+
+**Notas**:
+
+- shadcn quedó inicializado pero NO se usó en los mockups: B/C/D optaron por Tailwind directo para no bloquearse esperando a A en paralelo. Los componentes shadcn están disponibles para Step 21+.
+- `sonner` queda como reemplazo de `toast` en `base-nova` — si en Step 21 preferimos toasts shadcn radix-based, se reemplaza ahí.
+- Link "Ver" del superadmin apunta a `/superadmin/tenants/[slug]` (no existe en este sprint; romperá hasta Step 28).
+- El selector demo de `/t/[slug]/page.tsx` se elimina cuando entre Step 22 (auth + flujo real de login).
+
+Archivos clave: `apps/web/app/page.tsx`, `apps/web/app/t/[slug]/page.tsx`, `apps/web/app/t/[slug]/(admin)/{layout,admin/page,admin/students/page,admin/students/[id]/page}.tsx` + `(admin)/_components/admin-mobile-nav.tsx`, `apps/web/app/t/[slug]/(student)/{layout,student/page,student/exercises/[id]/page}.tsx` + `(student)/_components/student-bottom-nav.tsx`, `apps/web/app/superadmin/{layout,page,tenants/page}.tsx`, `apps/web/lib/{mock-data,subdomain,env,utils}.ts`, `apps/web/middleware.ts`, `apps/web/components/ui/*`, `apps/web/components.json`, `apps/web/app/globals.css`, `apps/web/.env.example` + `.env`, `apps/web/package.json` + `pnpm-lock.yaml` (deps de shadcn).
+
 ## Próxima acción concreta
 
-Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive. Reusa toda la infra del Step 7. Criterios en `docs/07-roadmap.md` Step 8.
+Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive. Reusa toda la infra del Step 7. Criterios en `docs/07-roadmap.md` Step 8. **Backend puro** — el frontend del login real entra en Step 22; los mockups de Step 7.5 son visuales y no tienen auth.
 
 ## Pendientes / deudas técnicas
 

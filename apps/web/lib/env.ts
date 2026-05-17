@@ -18,4 +18,8 @@ export const env = {
     'NEXT_PUBLIC_ROOT_HOST',
     process.env.NEXT_PUBLIC_ROOT_HOST,
   ),
+  contactWhatsapp: required(
+    'NEXT_PUBLIC_CONTACT_WHATSAPP',
+    process.env.NEXT_PUBLIC_CONTACT_WHATSAPP,
+  ),
 };

@@ -1,18 +1,34 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { extractTenantSlug } from './lib/subdomain';
+import { extractTenantSlug, isSuperadminHost } from './lib/subdomain';
 
 /**
- * Detecta el subdominio y reescribe a `/t/:slug`. Si no hay subdominio
- * (o es reservado: www, app), no toca nada y la request sigue al árbol
- * de rutas marketing (la landing).
+ * Routing por subdominio:
  *
- * Las rutas internas que ya empiezan en `/t/` se respetan tal cual para
- * evitar reescrituras dobles.
+ *   superadmin.<root>   → rewrite a /superadmin/...
+ *   <slug>.<root>       → rewrite a /t/<slug>/...
+ *   <root>              → landing comercial en /
+ *
+ * Las rutas internas que ya empiezan en `/t/` o `/superadmin/` se respetan
+ * tal cual para evitar reescrituras dobles.
  */
 export function middleware(req: NextRequest) {
   const host = req.headers.get('host');
-  const slug = extractTenantSlug(host);
 
+  // Superadmin tiene prioridad: queremos pisar cualquier otra heurística
+  // antes de mirar tenant slugs.
+  if (isSuperadminHost(host)) {
+    if (req.nextUrl.pathname.startsWith('/superadmin')) {
+      return NextResponse.next();
+    }
+    const url = req.nextUrl.clone();
+    url.pathname =
+      req.nextUrl.pathname === '/'
+        ? '/superadmin'
+        : `/superadmin${req.nextUrl.pathname}`;
+    return NextResponse.rewrite(url);
+  }
+
+  const slug = extractTenantSlug(host);
   if (!slug) return NextResponse.next();
   if (req.nextUrl.pathname.startsWith('/t/')) return NextResponse.next();
 
