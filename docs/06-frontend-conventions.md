@@ -207,6 +207,8 @@ El modo **voluntario** del mismo endpoint (`{ currentPassword, newPassword }`) s
 - Las utilities Tailwind correspondientes (`bg-brand-primary`, `text-brand-primary`, etc.) se resuelven contra esas vars. Para tonos custom que dependen del color del tenant (badges, bordes con alpha), se usa `style` inline con el valor crudo (`primary`) — Tailwind no genera utilities dinámicas.
 - Las superficies admin y marketing usan el theme fijo de Rutinex (sin override).
 
+> Hoy el theme es **dark fijo**: las CSS vars de `app/globals.css` viven en `:root` sin variante light. El toggle dark/light queda diferido a Fase 4 (ver `docs/07-roadmap.md`); cuando entre, las vars se reorganizan en `[data-theme="..."]` y se respeta `prefers-color-scheme`. Mientras tanto, no asumas light en ningún componente: contrastes y colores se diseñan contra el fondo oscuro.
+
 ## Mobile-first
 
 - Diseñar primero la vista mobile.

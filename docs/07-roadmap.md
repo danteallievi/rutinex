@@ -537,6 +537,7 @@ Sin numerar todavía. Cuando alguna de estas se priorice, se vuelve un step nume
 - Audit log de acciones del SUPERADMIN (crear tenant, reset password, toggle `is_active`, edit branding).
 - Rate limiting más agresivo en `superadmin.rutinex.app/login`.
 - Self-service signup si el modelo vuelve a PLG (reactivar `/auth/signup`, formulario en landing, validación de slug en signup, email de confirmación).
+- Toggle dark/light theme. Hoy todo el frontend asume dark fijo (las CSS vars de `apps/web/app/globals.css` están definidas en `:root`, sin variante light). Cuando se priorice: agregar palette light, mover las vars a un selector tipo `[data-theme="light"]`, persistir la preferencia (cookie/localStorage), respetar `prefers-color-scheme` como default, y exponer un toggle en el header de cada surface (landing, admin, student, superadmin). Decidir si el branding por tenant también tiene variantes light/dark del `primaryColor` o si se reutiliza el mismo.
 - Invitación de alumno por email/WhatsApp con link mágico.
 - Comentarios visibles al trainer + notifs.
 - PWA (manifest + service worker, install prompt).
