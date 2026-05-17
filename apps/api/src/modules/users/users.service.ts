@@ -66,6 +66,15 @@ export class UsersService {
   }
 
   /**
+   * Busca un user por su id (sin filtrar por tenant). Lo usa `change-password`
+   * para resolver el user autenticado por el JWT. Cualquier rol — incluido
+   * SUPERADMIN — entra por acá.
+   */
+  async findById(id: string): Promise<User | null> {
+    return this.usersRepository.findOne({ where: { id } });
+  }
+
+  /**
    * Crea un user respetando las invariantes por rol (ver docs/02-dominio.md
    * y ADR-013 / ADR-014):
    *
@@ -159,6 +168,27 @@ export class UsersService {
     const result = await this.usersRepository.update(
       { id },
       { mustChangePassword: value },
+    );
+    if (result.affected === 0) {
+      throw new NotFoundException({
+        code: 'USER_NOT_FOUND',
+        message: `User "${id}" no encontrado.`,
+      });
+    }
+  }
+
+  /**
+   * Actualiza `password_hash` y limpia `must_change_password` en la misma
+   * sentencia (atomico). Lo usa `POST /auth/change-password` para ambos
+   * modos (forzado y voluntario).
+   *
+   * Step 9 va a sumar la revocación de refresh tokens; por ahora la tabla
+   * `refresh_tokens` no existe.
+   */
+  async setPassword(id: string, passwordHash: string): Promise<void> {
+    const result = await this.usersRepository.update(
+      { id },
+      { passwordHash, mustChangePassword: false },
     );
     if (result.affected === 0) {
       throw new NotFoundException({

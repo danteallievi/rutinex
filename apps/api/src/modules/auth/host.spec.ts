@@ -1,4 +1,4 @@
-import { extractHostname, isSuperadminHost } from './host';
+import { extractHostname, extractTenantSlug, isSuperadminHost } from './host';
 
 describe('host helpers', () => {
   describe('extractHostname', () => {
@@ -54,6 +54,37 @@ describe('host helpers', () => {
 
     it('no se deja engañar por substring (`xsuperadmin.foo`)', () => {
       expect(isSuperadminHost('xsuperadmin.foo')).toBe(false);
+    });
+  });
+
+  describe('extractTenantSlug', () => {
+    it('extrae el slug del primer label', () => {
+      expect(extractTenantSlug('olimpo.rutinex.app')).toBe('olimpo');
+      expect(extractTenantSlug('olimpo.localhost')).toBe('olimpo');
+    });
+
+    it('rechaza prefijos reservados', () => {
+      expect(extractTenantSlug('superadmin.rutinex.app')).toBeNull();
+      expect(extractTenantSlug('www.rutinex.app')).toBeNull();
+    });
+
+    it('rechaza hosts sin punto (apex o bare)', () => {
+      expect(extractTenantSlug('rutinex.app')).toBe('rutinex');
+      expect(extractTenantSlug('localhost')).toBeNull();
+      expect(extractTenantSlug('')).toBeNull();
+      expect(extractTenantSlug(null)).toBeNull();
+    });
+
+    it('rechaza slugs con caracteres inválidos (DNS-safe)', () => {
+      expect(extractTenantSlug('Olimpo.localhost')).toBeNull(); // mayúsculas
+      expect(extractTenantSlug('-olimpo.localhost')).toBeNull(); // empieza con guion
+      expect(extractTenantSlug('olimpo_.localhost')).toBeNull(); // underscore
+      expect(extractTenantSlug('olim po.localhost')).toBeNull(); // espacio
+    });
+
+    it('acepta slugs con guiones intermedios', () => {
+      expect(extractTenantSlug('gym-olimpo.localhost')).toBe('gym-olimpo');
+      expect(extractTenantSlug('a-b-c.localhost')).toBe('a-b-c');
     });
   });
 });

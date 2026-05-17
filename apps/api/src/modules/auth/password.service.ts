@@ -15,6 +15,13 @@ export const GENERATED_PASSWORD_ALPHABET =
 export const GENERATED_PASSWORD_LENGTH = 16;
 
 /**
+ * Largo mínimo para passwords elegidas por humanos (alineado con la mínima
+ * del CLI `seed:superadmin`). Lo usan el DTO de `change-password` y la
+ * validación del seed; tener una sola constante evita drift entre ambos.
+ */
+export const MIN_USER_PASSWORD_LENGTH = 12;
+
+/**
  * Parámetros Argon2id (OWASP 2024, ver `docs/04-auth.md`).
  *
  * Encapsulados para tests; cualquier cambio acá invalida hashes existentes

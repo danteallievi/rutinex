@@ -2,6 +2,7 @@ import { ConflictException } from '@nestjs/common';
 
 import type { User } from '../users/entities/user.entity';
 import type { UsersService } from '../users/users.service';
+import { MIN_USER_PASSWORD_LENGTH } from './password.service';
 import type { PasswordService } from './password.service';
 
 export interface SeedSuperadminInput {
@@ -11,8 +12,11 @@ export interface SeedSuperadminInput {
   lastName?: string;
 }
 
-/** Largo mínimo para passwords elegidas por humanos (no las generadas). */
-export const MIN_HUMAN_PASSWORD_LENGTH = 12;
+/**
+ * Re-export con el nombre histórico que usa el CLI. Apunta a la constante
+ * compartida en `password.service.ts` para evitar drift.
+ */
+export const MIN_HUMAN_PASSWORD_LENGTH = MIN_USER_PASSWORD_LENGTH;
 
 /** Regex razonable para email: <local>@<host>.<tld>. No es RFC perfecto. */
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

@@ -146,24 +146,25 @@ Aplica cuando se crea un OWNER (por SUPERADMIN), un TRAINER (por OWNER), o se re
 
 ### Change password
 
-Mismo endpoint, dos modos según `users.must_change_password`:
+Mismo endpoint, dos modos según `users.must_change_password`. La fortaleza mínima de la nueva password está fijada en **12 caracteres** (`MIN_USER_PASSWORD_LENGTH` en `apps/api/src/modules/auth/password.service.ts`), alineada con la mínima del CLI `seed:superadmin`. El DTO lo valida con `@MinLength(MIN_USER_PASSWORD_LENGTH)` → 400 automático si la nueva password es muy corta. Sin reglas extra de complejidad por ahora; cualquier cambio futuro se ajusta tocando la constante.
 
 **Forzado (`must_change_password=true`)**:
 
-1. Cliente: `POST /auth/change-password { newPassword }` con bearer (el JWT del login con la password generada autentica al user; no se pide la password actual porque el flujo asume que el user la recibió por WhatsApp y la quiere reemplazar al toque).
-2. Validar fortaleza de la nueva (longitud mínima, etc.).
+1. Cliente: `POST /auth/change-password { newPassword }` con bearer (el JWT del login con la password generada autentica al user; no se pide la password actual porque el flujo asume que el user la recibió por WhatsApp y la quiere reemplazar al toque). Si llega `currentPassword`, se ignora.
+2. Validar fortaleza de la nueva (`MIN_USER_PASSWORD_LENGTH`, ver arriba).
 3. Hashear con Argon2id.
 4. Update `users.password_hash` + `must_change_password=false`.
-5. Revocar todos los refresh tokens del user (forzar re-login en otros devices).
+5. Revocar todos los refresh tokens del user (forzar re-login en otros devices) — implementado en Step 9, no en Step 8.
 6. Devolver 204.
 
 **Voluntario (`must_change_password=false`)**:
 
 1. Cliente: `POST /auth/change-password { currentPassword, newPassword }` con bearer.
-2. Verificar `currentPassword` con Argon2. Si no matchea → 401 genérico.
-3. Hashear nueva. Update `users.password_hash`.
-4. Revocar todos los refresh tokens del user.
-5. Devolver 204.
+2. Si falta `currentPassword` → 400 `CURRENT_PASSWORD_REQUIRED`.
+3. Verificar `currentPassword` con Argon2. Si no matchea → 401 genérico (`INVALID_CREDENTIALS`).
+4. Hashear nueva. Update `users.password_hash`.
+5. Revocar todos los refresh tokens del user (Step 9).
+6. Devolver 204.
 
 > Decisión: **no usamos magic links ni activation tokens** para el primer login. La password generada que se entrega por WhatsApp ya cumple ese rol y simplifica el modelo (un solo flujo de auth, sin tabla de tokens de activación). Ver ADR-013.
 

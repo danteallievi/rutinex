@@ -196,15 +196,16 @@ Convención: `code` es un `UPPER_SNAKE_CASE` opcional. Se incluye cuando el fron
 
 `code` es contrato entre back y front: si lo renombrás, es breaking change para el cliente. Decisión ADR-010.
 
-| Status | code                  | Caso                                                                                     | Módulo  |
-| ------ | --------------------- | ---------------------------------------------------------------------------------------- | ------- |
-| 404    | `TENANT_NOT_FOUND`    | `GET /tenants/by-slug/:slug` no existe o no activo                                       | tenants |
-| 409    | `SLUG_RESERVED`       | `POST /superadmin/tenants` con slug en la lista de reservados                            | tenants |
-| 409    | `SLUG_TAKEN`          | `POST /superadmin/tenants` con slug ya existente                                         | tenants |
-| 401    | `INVALID_CREDENTIALS` | `POST /auth/login` (host inválido, user inexistente o password incorrecta) — genérico    | auth    |
-| 403    | `TENANT_INACTIVE`     | `POST /auth/login` o `POST /auth/student-login` cuando el tenant tiene `is_active=false` | auth    |
-| 403    | `USER_INACTIVE`       | Login OK pero el user tiene `is_active=false`                                            | auth    |
-| 403    | `NOT_SUPERADMIN`      | `SuperadminGuard` rechaza request con JWT que no es SUPERADMIN                           | auth    |
+| Status | code                        | Caso                                                                                     | Módulo  |
+| ------ | --------------------------- | ---------------------------------------------------------------------------------------- | ------- |
+| 404    | `TENANT_NOT_FOUND`          | `GET /tenants/by-slug/:slug` no existe o no activo                                       | tenants |
+| 409    | `SLUG_RESERVED`             | `POST /superadmin/tenants` con slug en la lista de reservados                            | tenants |
+| 409    | `SLUG_TAKEN`                | `POST /superadmin/tenants` con slug ya existente                                         | tenants |
+| 401    | `INVALID_CREDENTIALS`       | `POST /auth/login` (host inválido, user inexistente o password incorrecta) — genérico    | auth    |
+| 403    | `TENANT_INACTIVE`           | `POST /auth/login` o `POST /auth/student-login` cuando el tenant tiene `is_active=false` | auth    |
+| 403    | `USER_INACTIVE`             | Login OK pero el user tiene `is_active=false`                                            | auth    |
+| 403    | `NOT_SUPERADMIN`            | `SuperadminGuard` rechaza request con JWT que no es SUPERADMIN                           | auth    |
+| 400    | `CURRENT_PASSWORD_REQUIRED` | `POST /auth/change-password` en modo voluntario sin `currentPassword`                    | auth    |
 
 > Mantener esta tabla cuando se agreguen códigos nuevos.
 

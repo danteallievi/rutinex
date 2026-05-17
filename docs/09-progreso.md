@@ -4,11 +4,19 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 
 ## Estado general
 
-**Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 7.5 completo (sprint visual descartable encima del Step 7). Próximo: Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive.
-**Última actualización**: 2026-05-17 — Step 7.5 (sprint visual multi-surface: landing comercial, admin mockup, student mockup, superadmin mockup).
+**Fase actual**: Fase 1 — Backend foundations.
+**Paso actual**: Step 8 completo. Próximo: Step 9 — Refresh tokens + rotación + detección de reuso.
+**Última actualización**: 2026-05-17 — Step 8 (login tenant + student-login + change-password + tenant/user inactive + JwtAuthGuard global).
 
 ## Cambios de doc
+
+### 2026-05-17 — Arquitectura de design tokens + stack tipográfico (sin código)
+
+Codificación de la arquitectura visual **antes** de implementar el toggle dark/light (Fase 4), para que el step de implementación sea traducción mecánica del ADR y no mezclado refactor + feature. También deja decidido el swap tipográfico (Geist → Montserrat sans + JetBrains Mono mono) para que entre en el mismo step de refactor visual y no como cambio suelto. Sin tocar código todavía (los mockups del Step 7.5 quedan con Geist hasta que entre la Fase 4).
+
+- `docs/08-decisiones.md`: nuevo **ADR-016** — sistema de design tokens en 3 capas (brand → semantic → component) + tenant overlay acotado a un set de vars overridables + stack tipográfico (Montserrat / JetBrains Mono, serif diferido a cuando aparezca el caso).
+- `docs/06-frontend-conventions.md`: reescrita la sección "Theming y branding" con la arquitectura nueva (las 3 capas, la regla mental para consumir cada una, el contrato del tenant overlay vía `tenantThemeVars(branding)`, el plan de dark/light, el stack de fuentes, y una nota explícita de que el código actual de `globals.css` es preliminar — la migración va en Fase 4).
+- `docs/07-roadmap.md`: el item de Fase 4 "Toggle dark/light theme" se reescribió como un paquete único de refactor visual con 7 sub-tareas concretas (partir `globals.css`, renombrar vars semánticas, `lib/theme.ts`, swap de fuentes, variante light, toggle en las 4 surfaces, smoke visual sobre las 9 rutas del Step 7.5). Criterio explícito: rebrand hipotético = tocar solo capa 1.
 
 ### 2026-05-17 — Cambio a onboarding sales-led (sin código)
 
@@ -309,9 +317,64 @@ Estructura: 4 sub-agentes paralelos (uno por surface, sin colisión de archivos)
 
 Archivos clave: `apps/web/app/page.tsx`, `apps/web/app/t/[slug]/page.tsx`, `apps/web/app/t/[slug]/(admin)/{layout,admin/page,admin/students/page,admin/students/[id]/page}.tsx` + `(admin)/_components/admin-mobile-nav.tsx`, `apps/web/app/t/[slug]/(student)/{layout,student/page,student/exercises/[id]/page}.tsx` + `(student)/_components/student-bottom-nav.tsx`, `apps/web/app/superadmin/{layout,page,tenants/page}.tsx`, `apps/web/lib/{mock-data,subdomain,env,utils}.ts`, `apps/web/middleware.ts`, `apps/web/components/ui/*`, `apps/web/components.json`, `apps/web/app/globals.css`, `apps/web/.env.example` + `.env`, `apps/web/package.json` + `pnpm-lock.yaml` (deps de shadcn).
 
+### Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive (2026-05-17)
+
+Completa el surface auth para los tres roles del tenant (OWNER/TRAINER por email+password, STUDENT por DNI) y deja `change-password` operativo para ambos modos (forzado y voluntario). `JwtAuthGuard` pasa a ser global, con `@Public()` para opt-out. Sin refresh tokens todavía (Step 9).
+
+**Cambios en `host.ts`**: nuevo `extractTenantSlug(hostname)` — parsea el primer label del hostname y devuelve el slug si matchea el regex DNS-safe y no es un prefijo reservado (`www`, `superadmin`). No consulta DB. `isSuperadminHost` queda igual.
+
+**`POST /auth/login`** (extendido):
+
+- Host `superadmin.*` → flujo SUPERADMIN (sin cambios respecto a Step 7).
+- Host `<slug>.*` con slug válido → resuelve tenant vía `TenantsService.findBySlugIncludingInactive(slug)` (nuevo método que NO tira 404 cuando el tenant está pausado, a diferencia del `findBySlug` público que sigue tirándolo para no filtrar existencia en la página del tenant). Si el tenant no existe → 401 genérico. Si `is_active=false` → 403 `TENANT_INACTIVE`. Busca user por `findByEmailAndTenant(tenant.id, email)`. Si no existe o no tiene password → 401 genérico. Si `user.is_active=false` → 403 `USER_INACTIVE`. Verifica password, emite JWT con `{ sub, tenantId, role, isSuperadmin: false }`.
+- Cualquier otro host (sin punto, sin slug válido, prefijo reservado) → 401 genérico.
+- Response shape: `{ accessToken, user: { id, role, isSuperadmin, mustChangePassword, firstName, lastName, tenant: { id, slug, name } | null } }`.
+
+**`POST /auth/student-login`** (nuevo): solo válido en hosts de tenant. Body `{ dni }`. Mismas reglas de TENANT_INACTIVE / USER_INACTIVE. `mustChangePassword` siempre `false` para STUDENTS. Si llega desde `superadmin.*` → 401 genérico (no se filtra que este endpoint no exista en ese surface). DTO valida `dni: ^[0-9]+$` (4-20 chars) → 400 si no es numérico.
+
+**`POST /auth/change-password`** (nuevo):
+
+- Requiere JWT válido (lo cubre el `JwtAuthGuard` global, sin `@Public()`). Resuelve el user con `UsersService.findById(sub)`.
+- Si `user.must_change_password=true` → modo forzado: acepta sólo `newPassword`. Si llega `currentPassword`, se ignora.
+- Si `user.must_change_password=false` → modo voluntario: requiere `currentPassword`. Si falta → 400 `CURRENT_PASSWORD_REQUIRED`. Si no matchea → 401 `INVALID_CREDENTIALS`.
+- Hashea con `PasswordService.hash` y atómicamente setea `password_hash` + `must_change_password=false` vía `UsersService.setPassword(id, hash)` (nuevo método).
+- TODO Step 9: revocar todos los refresh tokens del user.
+- Política mínima de fortaleza: `MIN_USER_PASSWORD_LENGTH = 12` (exportada desde `password.service.ts`, alineada con el CLI seed). Validada por el DTO con `@MinLength`. Sin reglas extra de complejidad por ahora; en `docs/04-auth.md` queda documentada la decisión.
+- Devuelve 204 (HttpStatus.NO_CONTENT).
+
+**`JwtAuthGuard` global**: registrado como `APP_GUARD` en `AuthModule`. Usa `Reflector` para detectar el meta `IS_PUBLIC_KEY` y saltarse handlers/controllers marcados con `@Public()`. Decorador `@Public()` agregado en `apps/api/src/modules/auth/public.decorator.ts`. Aplicado a: `AppController` (clase, healthcheck `GET /`), `TenantsController` (clase, `POST /tenants` y `GET /tenants/by-slug/:slug`), y los métodos `login` + `studentLogin` en `AuthController`. El `SuperadminController` ya no necesita `@UseGuards(JwtAuthGuard)` (lo cubre el global); queda sólo `@UseGuards(SuperadminGuard)`.
+
+**`TenantsService.findBySlugIncludingInactive(slug)`**: devuelve el tenant aunque `is_active=false`. Lo necesita el auth flow para distinguir "slug no existe" (401) de "tenant pausado" (403). El método público `findBySlug` sigue tirando 404 para ambos casos (filtra existencia).
+
+**`UsersService.findById(id)` y `setPassword(id, hash)`**: dos helpers nuevos. `findById` resuelve el user del JWT en `change-password`. `setPassword` actualiza `password_hash` y limpia `must_change_password` en la misma sentencia (atómico).
+
+**Decisión: no se implementa LocalStrategy**. El roadmap lo mencionaba como parte del Step 8, pero ya validamos credenciales directo en el service (mismo patrón que Step 7) y agregarlo era ceremony pura: LocalStrategy sólo cobra valor cuando se usa `@UseGuards(AuthGuard('local'))` para inyectar `req.user` en el handler, y nuestro `login` parsea el body directamente. Si en el futuro queremos passport-local por consistencia con docs/standards, se agrega ahí — sin perder nada de seguridad por dejarlo afuera.
+
+**Códigos de error nuevos** (documentados en `docs/05-api-conventions.md`):
+
+- 400 `CURRENT_PASSWORD_REQUIRED` (change-password en modo voluntario sin la password actual).
+- `TENANT_INACTIVE` y `USER_INACTIVE` (ya estaban listados pero ahora se emiten desde login + student-login).
+
+Tests:
+
+- Unit (`auth.service.spec.ts`): 23 casos cubriendo SUPERADMIN, tenant (OK, tenant inexistente, tenant inactivo, user inexistente, user inactivo, password incorrecta), student-login (todos los casos), change-password (forzado, voluntario sin currentPassword, voluntario con currentPassword mal, voluntario OK, user inexistente, user sin password).
+- Host (`host.spec.ts`): + 4 cases para `extractTenantSlug` (extracción, reservados, hosts sin punto, slugs inválidos, slugs con guiones).
+- E2E (`auth.e2e-spec.ts`): cubre los 7-8 casos del roadmap — OWNER login tenant, TRAINER con password generada, STUDENT por DNI, cross-host (SUPERADMIN desde tenant, OWNER desde superadmin), TENANT_INACTIVE, USER_INACTIVE, must_change_password roundtrip completo (login → 204 change → password vieja falla → password nueva funciona → mustChangePassword=false), change-password voluntario (400 sin currentPassword, 401 con currentPassword mal, 204 con currentPassword OK, 400 con newPassword < 12 chars). Mantiene los E2E del Step 7 sin regresión.
+
+Verificación: `pnpm lint` clean en root. `pnpm --filter @rutinex/api test` 94/94 (71 previos + 23 nuevos en host + auth-service). `pnpm --filter @rutinex/api test:e2e` 41/41 (23 previos del Step 7 + 18 nuevos en auth.e2e-spec.ts).
+
+Archivos clave: `apps/api/src/modules/auth/{auth.service,auth.controller,auth.module,host,jwt-auth.guard,public.decorator,password.service}.ts` + `dto/{student-login,change-password}.dto.ts` + sus `*.spec.ts`, `apps/api/src/modules/users/users.service.ts` (`findById`, `setPassword`), `apps/api/src/modules/tenants/{tenants.service,tenants.controller}.ts` (`findBySlugIncludingInactive` + `@Public()`), `apps/api/src/modules/superadmin/superadmin.controller.ts` (saca el `JwtAuthGuard` explícito), `apps/api/src/app.controller.ts` (`@Public()`), `apps/api/test/auth.e2e-spec.ts`, `docs/04-auth.md`, `docs/05-api-conventions.md`.
+
+Notas:
+
+- El parser de host es liberal: `extractTenantSlug('rutinex.app')` devuelve `'rutinex'`. No es un problema porque `rutinex` está en la lista de slugs reservados (`apps/api/src/modules/tenants/slug.ts`) y no puede existir en DB → la query devuelve null → 401 genérico. El parser sólo skipea explícitamente `www` y `superadmin` porque son surfaces distintas (no deben caer en el flujo de tenant).
+- Filtrado de existencia parcial: si alguien adivina el slug correcto pero el tenant está inactivo, recibe `TENANT_INACTIVE` (mensaje "Tu cuenta está pausada..."). Esto leakea existencia de tenants inactivos. La doc lo acepta como trade-off (mensaje pensado para el OWNER legítimo). Si más adelante queremos blindar, se puede retornar 401 genérico también para inactivos y mostrar el mensaje friendly recién después del primer login exitoso del OWNER.
+- El `@Public()` decorator vive en `apps/api/src/modules/auth/` pero lo consumen también `TenantsController` y `AppController`. No genera ciclo de módulos porque el decorator es un standalone (no importa nada de `auth.module`).
+- `MIN_HUMAN_PASSWORD_LENGTH` en `seed-superadmin.ts` ahora es un re-export de `MIN_USER_PASSWORD_LENGTH` (en `password.service.ts`) — un solo lugar de verdad para que CLI seed y `change-password` no driften.
+
 ## Próxima acción concreta
 
-Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive. Reusa toda la infra del Step 7. Criterios en `docs/07-roadmap.md` Step 8. **Backend puro** — el frontend del login real entra en Step 22; los mockups de Step 7.5 son visuales y no tienen auth.
+Step 9 — Refresh tokens: entity + migración (`refresh_tokens` con `tenant_id` nullable para SUPERADMINs), `POST /auth/refresh` con rotación, `POST /auth/logout` + `POST /auth/logout-all`, detección de reuso (si llega un refresh ya revocado, revocar todos los del user), cookie httpOnly secure `SameSite=Lax` scope `.rutinex.app`. El TODO sembrado en `change-password` ("revocar refresh tokens") se completa en este step.
 
 ## Pendientes / deudas técnicas
 

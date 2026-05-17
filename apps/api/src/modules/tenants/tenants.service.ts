@@ -55,4 +55,14 @@ export class TenantsService {
     }
     return tenant;
   }
+
+  /**
+   * Devuelve el tenant aunque `is_active=false`. Pensado para el login:
+   * el flujo necesita distinguir "slug inexistente" (401 genérico) de
+   * "tenant pausado" (403 `TENANT_INACTIVE`), cosa que `findBySlug` no
+   * permite porque devuelve 404 en ambos casos.
+   */
+  async findBySlugIncludingInactive(slug: string): Promise<Tenant | null> {
+    return this.tenantsRepository.findOne({ where: { slug } });
+  }
 }
