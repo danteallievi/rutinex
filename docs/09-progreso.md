@@ -4,9 +4,9 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 
 ## Estado general
 
-**Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 4 completo. Próximo: Step 5 — Entity User + módulo Users.
-**Última actualización**: 2026-05-16 — Step 4 (módulo Tenants + resolución por slug) completado.
+**Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
+**Paso actual**: Step 4.5 completo. Próximo: Step 5 — Entity User + módulo Users.
+**Última actualización**: 2026-05-17 — Step 4.5 (interludio visual: landing + subdominios + branding) completado.
 
 ## Pasos completados
 
@@ -98,6 +98,43 @@ Notas:
 - Se agregó `auth` a la lista de reservados respecto a la doc original.
 - Nuevo shape de error de negocio: `ConflictException({ code: 'SLUG_RESERVED' | 'SLUG_TAKEN', message })` y `NotFoundException({ code: 'TENANT_NOT_FOUND', message })`. El filtro preserva el `code` en el body.
 - El `app.e2e-spec.ts` pasó de `beforeEach` a `beforeAll` + `afterAll(app.close())` para evitar el warning "worker process failed to exit gracefully".
+
+### Step 4.5 — Interludio visual: multi-tenancy en pantalla (2026-05-17)
+
+Mini-frontend que muestra el flujo multi-tenant funcionando con lo del Step 4. No estaba en el plan original; quedó intercalado entre Step 4 y Step 5 para tener algo visceral antes de seguir con backend puro.
+
+Backend:
+
+- `apps/api/src/main.ts`: `app.enableCors({ origin: [/^http:\/\/localhost(:\d+)?$/, /^http:\/\/[a-z0-9-]+\.localhost(:\d+)?$/] })` para que la web en `localhost:3000` y los subdominios `*.localhost:3000` puedan llamar al API en `localhost:3001`. En prod hay que cambiarlo por `rutinex.app` y `*.rutinex.app` (Step 27).
+
+Frontend (`apps/web`):
+
+- `.env.example` + `.env` con `NEXT_PUBLIC_API_URL` y `NEXT_PUBLIC_ROOT_HOST`.
+- `lib/env.ts`: acceso tipado a env vars con guard de "missing".
+- `lib/subdomain.ts`: `extractTenantSlug(host)` extrae el slug desde `*.localhost:3000` o `*.rutinex.app`. Reservados (`www`, `app`) devuelven `null`.
+- `lib/api-client.ts`: `createTenant`, `getTenantBySlug`, y `ApiClientError` tipado con `status` + `body.code`.
+- `middleware.ts`: matchea todo excepto assets internos. Si hay slug, reescribe `/` a `/t/:slug` (y `/foo` a `/t/:slug/foo`). Si no, deja pasar (landing).
+- `app/page.tsx`: landing con hero + form de signup (client component en `app/signup-form.tsx`). El form auto-genera slug desde el nombre, valida regex contra `^[a-z0-9]+(-[a-z0-9]+)*$` localmente, mapea `code: SLUG_TAKEN/SLUG_RESERVED` a mensajes user-friendly y redirige cross-origin a `http://${slug}.${rootHost}` post-creación.
+- `app/t/[slug]/page.tsx`: server component con `dynamic = 'force-dynamic'`. Llama `getTenantBySlug`, aplica `branding.primaryColor` como CSS var y lo pinta en hero + button + badge + dots. Si hay `logoUrl` lo mete en el header. Si el API responde 404, llama `notFound()`.
+- `app/t/[slug]/not-found.tsx`: 404 dedicado al tenant, con link de vuelta a la landing.
+- `app/globals.css` y `app/layout.tsx`: theme dark con CSS vars (`--background`, `--foreground`, `--muted`, `--brand-primary`, etc.), `lang="es"`, metadata mínima.
+
+Smoke manual (con `pnpm api:dev` + `pnpm web:dev` arriba):
+
+- `GET localhost:3000/` → 200, landing con form.
+- `POST localhost:3001/tenants {slug: 'demo-step-4-5', name: 'Demo Gym 4.5', branding: { primaryColor: '#22d3ee' }}` → 201 con header `Access-Control-Allow-Origin: http://localhost:3000`.
+- `GET demo-step-4-5.localhost:3000/` → 200, página del tenant con el `#22d3ee` aplicado y "Demo Gym 4.5" en el header.
+- `GET foo.localhost:3000/` → 404, página "Este gimnasio no existe".
+- `GET www.localhost:3000/` → 200, cae a la landing (subdominio reservado).
+
+Archivos clave: `apps/api/src/main.ts`, `apps/web/.env.example`, `apps/web/lib/{env,subdomain,api-client}.ts`, `apps/web/middleware.ts`, `apps/web/app/{layout,page,globals.css,signup-form}.tsx`, `apps/web/app/t/[slug]/{page,not-found}.tsx`.
+
+Notas:
+
+- shadcn/ui formal queda para el Step 20 (init + components.json). Acá fuimos con Tailwind 4 directo para no entreverar la CLI de shadcn con la config nueva de Tailwind 4 a mitad de paso.
+- El middleware no rechaza tenants inexistentes: deja pasar la request hacia `/t/<slug>`; la página llama al API y si el API responde 404, se renderiza `not-found.tsx`. Beneficio: una sola fuente de verdad (el API). Costo: una request extra perdida en cada slug malicioso. Aceptable para MVP.
+- El path alias `@/*` (apuntando a `./*` desde `apps/web`) ya estaba configurado en `tsconfig.json` desde el `create-next-app` del Step 1.
+- `cache: 'no-store'` en `getTenantBySlug` para que el branding recién creado se vea al toque post-signup. En prod podemos pasar a `revalidate: 30` cuando convenga.
 
 ## Próxima acción concreta
 

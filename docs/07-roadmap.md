@@ -72,6 +72,26 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
+### Step 4.5 — Interludio visual: multi-tenancy en pantalla
+
+**Objetivo**: meter una mini-superficie web encima de lo que tenemos para ver el flujo multi-tenant funcionando antes de seguir con backend puro. No está en el plan original (la fase 2 era el frontend), pero queremos visceralidad temprana. Adelanta lo mecánico del Step 20 sin tocar auth.
+
+**Hacer**:
+
+- En `apps/api`: CORS habilitado para `localhost` y `*.localhost` en dev.
+- En `apps/web`:
+  - `lib/env.ts`, `lib/api-client.ts` con `createTenant` + `getTenantBySlug`, `lib/subdomain.ts` con `extractTenantSlug`.
+  - `middleware.ts` que detecta subdominio y reescribe a `/t/:slug`. Reservados (`www`, `app`) → no se tratan como tenant.
+  - Landing en `/`: hero + form de signup (name + slug + primaryColor) que postea a `POST /tenants` y redirige a `http://<slug>.localhost:3000`.
+  - Página del tenant en `app/t/[slug]/page.tsx`: server component que hace `GET /tenants/by-slug/:slug` y aplica `branding.primaryColor` como CSS var + muestra `logoUrl` si está.
+  - `app/t/[slug]/not-found.tsx`: 404 cuando el slug no existe / `is_active=false`.
+- `.env.example` actualizado con `NEXT_PUBLIC_API_URL`.
+- shadcn/ui formal queda diferido al Step 20 — acá vamos con Tailwind directo para no enredarnos con la CLI de shadcn + Tailwind 4 a mitad de paso.
+
+**Criterio**: en el navegador, `localhost:3000` muestra la landing; signup crea el tenant y redirige; `<slug>.localhost:3000` muestra el nombre del gimnasio con el color primario aplicado; un slug inexistente muestra el 404. Sin tests automáticos nuevos (el backend ya está cubierto en Step 4); el smoke es manual en browser.
+
+---
+
 ### Step 5 — Entity User + módulo Users
 
 **Objetivo**: tabla `users` y CRUD interno.
