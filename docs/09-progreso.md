@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 5 completo. Próximo: Step 6 — Argon2 + helpers de password.
-**Última actualización**: 2026-05-17 — Step 5 (entity User + módulo Users con superadmin desde el arranque).
+**Paso actual**: Step 6 completo. Próximo: Step 7 — Superadmin: schema + seed CLI + login básico.
+**Última actualización**: 2026-05-17 — Step 6 (Argon2id + helpers de password).
 
 ## Cambios de doc
 
@@ -182,9 +182,36 @@ Notas:
 - El service rechaza estados imposibles con `BadRequestException` + `code` (`SUPERADMIN_MUST_HAVE_NO_TENANT`, `STUDENT_NO_PASSWORD`, etc.) antes de invocar la DB. Si más adelante el `code` se necesita en el frontend, queda agregarlo a la tabla de `docs/05-api-conventions.md` cuando un endpoint lo exponga (en Step 5 ningún endpoint expone estos errores todavía, así que no se documenta como contrato público aún).
 - `subscription_status` sigue diferido (no aparece en la entity ni en la migración), alineado con `docs/02-dominio.md`.
 
+### Step 6 — Argon2 + helpers de password (2026-05-17)
+
+`AuthModule` mínimo (sin controllers todavía) en `apps/api/src/modules/auth/` con `PasswordService` que centraliza hash, verify y generación de passwords. Dependencia `argon2` (^0.44.0) agregada a `apps/api`.
+
+`PasswordService` en `apps/api/src/modules/auth/password.service.ts`:
+
+- `hash(plain)`: Argon2id con `memoryCost=19456`, `timeCost=2`, `parallelism=1` (mínimo OWASP 2024 — ver `docs/04-auth.md`). Constantes exportadas como `ARGON2_OPTIONS` para que los tests las consuman sin duplicarlas.
+- `verify(hash, plain)`: wraps `argon2.verify` en try/catch y devuelve `false` ante hash corrupto o algoritmo no soportado (queremos 401 genérico en login, no 500).
+- `generate()`: 16 chars de un alfabeto de 56 símbolos (`[a-zA-Z0-9]` menos `0`, `O`, `o`, `1`, `l`, `I`). Usa `crypto.randomBytes` con rejection sampling (`maxValid = 256 - 256 % 56 = 224`) para evitar sesgo modular. Constantes `GENERATED_PASSWORD_ALPHABET` y `GENERATED_PASSWORD_LENGTH` exportadas.
+
+Tests (`password.service.spec.ts`, 8 cases):
+
+- hash + verify roundtrip; verify rechaza password incorrecta; verify devuelve `false` (no throw) ante hash corrupto; el string del hash contiene `m=19456`, `t=2`, `p=1`.
+- `generate()` produce strings del largo esperado; sólo usa caracteres del alfabeto permitido; nunca incluye `0/O/o/1/l/I`; 20 invocaciones devuelven 20 valores distintos.
+
+`AuthModule` registrado en `AppModule` para que esté disponible cuando Step 7 cablée el primer endpoint de auth.
+
+Archivos clave: `apps/api/src/modules/auth/{password.service,password.service.spec,auth.module}.ts`, `apps/api/src/app.module.ts` (import del módulo), `apps/api/package.json` (+`argon2`).
+
+Verificación: `pnpm --filter @rutinex/api test` 45/45 verde (37 previos + 8 nuevos). `pnpm lint` clean.
+
+Notas:
+
+- `argon2.verify` puede tirar (no devolver `false`) si el hash no parsea. El wrap en try/catch convierte eso en `false` para que el caller no tenga que distinguir entre "no matchea" y "no es un hash válido" — los dos llevan al mismo 401 genérico.
+- Se eligió `crypto.randomBytes` + rejection sampling sobre `crypto.randomInt` para apegarse al criterio explícito del Step 6 ("CSPRNG via `crypto.randomBytes`") y dejar visible el cálculo de `maxValid` que evita el sesgo modular.
+- `docs/04-auth.md` ya documenta la política completa (params Argon2id y alfabeto sin ambiguos); este step solo la implementa, no la cambia.
+
 ## Próxima acción concreta
 
-Step 6 — Argon2 + helpers de password (`apps/api/src/modules/auth/password.service.ts` con `hash`, `verify`, `generate()` — 16 chars del alfabeto sin caracteres ambiguos, CSPRNG). Criterios en `docs/07-roadmap.md` Step 6.
+Step 7 — Superadmin: schema + seed CLI + login básico. Migración ya está aplicada (Step 5). Falta script `pnpm --filter api seed:superadmin` que hashea con `PasswordService.hash`, crea el SUPERADMIN, y un `POST /auth/login` mínimo que soporte el host `superadmin.*` con emisión de JWT (sin refresh todavía) + `SuperadminGuard`. Criterios en `docs/07-roadmap.md` Step 7.
 
 ## Pendientes / deudas técnicas
 

@@ -7,6 +7,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { getDataSourceOptions } from './config/database';
+import { AuthModule } from './modules/auth/auth.module';
 import { TenantsModule } from './modules/tenants/tenants.module';
 import { UsersModule } from './modules/users/users.module';
 
@@ -18,6 +19,7 @@ import { UsersModule } from './modules/users/users.module';
     }),
     TenantsModule,
     UsersModule,
+    AuthModule,
   ],
   controllers: [AppController],
   providers: [
