@@ -156,6 +156,20 @@ findAll(@TenantId() tenantId: string, @Query() query: ListRoutinesQuery) {
 }
 ```
 
+### Rutas del superadmin (`/superadmin/*`)
+
+Las rutas bajo el prefijo `/superadmin/*` son cross-tenant por naturaleza (crean tenants, listan todos, resetean passwords). No siguen el contrato de tenant scoping:
+
+- **No** requieren header `x-tenant-slug`.
+- **No** pasan por `TenantGuard`.
+- Protegidas por `SuperadminGuard` (verifica `req.user.isSuperadmin === true`).
+- Los services correspondientes operan sin `tenantId` o lo reciben como **parámetro de input** del request (ej. "resetear OWNER del tenant X").
+- Cuando estos services consultan `users`, deben tener en cuenta que existen filas con `tenant_id IS NULL` (los propios SUPERADMINs). Si un endpoint listael universo de "users finales" (OWNER/TRAINER/STUDENT), debe excluir SUPERADMINs explícitamente con `WHERE is_superadmin = false` o `WHERE tenant_id IS NOT NULL`.
+
+### Queries sin filtro por `tenant_id` (scripts, joins globales)
+
+Cualquier query que no filtre por `tenant_id` (scripts de mantenimiento, agregaciones de SUPERADMIN, joins cross-tenant) verá también las filas de SUPERADMIN (`tenant_id IS NULL`). Si la intención es "users finales", agregar el filtro explícito. Si la intención es "todos incluido SUPERADMIN", documentarlo en el call site.
+
 ## Errores
 
 | Caso                                         | Excepción                         |
@@ -182,11 +196,13 @@ Convención: `code` es un `UPPER_SNAKE_CASE` opcional. Se incluye cuando el fron
 
 `code` es contrato entre back y front: si lo renombrás, es breaking change para el cliente. Decisión ADR-010.
 
-| Status | code               | Caso                                               | Módulo  |
-| ------ | ------------------ | -------------------------------------------------- | ------- |
-| 404    | `TENANT_NOT_FOUND` | `GET /tenants/by-slug/:slug` no existe o no activo | tenants |
-| 409    | `SLUG_RESERVED`    | `POST /tenants` con slug en la lista de reservados | tenants |
-| 409    | `SLUG_TAKEN`       | `POST /tenants` con slug ya existente              | tenants |
+| Status | code               | Caso                                                                                     | Módulo  |
+| ------ | ------------------ | ---------------------------------------------------------------------------------------- | ------- |
+| 404    | `TENANT_NOT_FOUND` | `GET /tenants/by-slug/:slug` no existe o no activo                                       | tenants |
+| 409    | `SLUG_RESERVED`    | `POST /superadmin/tenants` con slug en la lista de reservados                            | tenants |
+| 409    | `SLUG_TAKEN`       | `POST /superadmin/tenants` con slug ya existente                                         | tenants |
+| 403    | `TENANT_INACTIVE`  | `POST /auth/login` o `POST /auth/student-login` cuando el tenant tiene `is_active=false` | auth    |
+| 403    | `USER_INACTIVE`    | Login OK pero el user tiene `is_active=false`                                            | auth    |
 
 > Mantener esta tabla cuando se agreguen códigos nuevos.
 

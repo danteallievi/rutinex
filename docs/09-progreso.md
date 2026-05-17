@@ -5,8 +5,24 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 4.5 completo. Próximo: Step 5 — Entity User + módulo Users.
-**Última actualización**: 2026-05-17 — Step 4.5 (interludio visual: landing + subdominios + branding) completado.
+**Paso actual**: Step 4.5 completo. Próximo: Step 5 — Entity User + módulo Users (ahora con superadmin desde el arranque).
+**Última actualización**: 2026-05-17 — cambio de modelo a sales-led (ver "Cambios de doc" abajo). Sin cambios de código todavía.
+
+## Cambios de doc
+
+### 2026-05-17 — Cambio a onboarding sales-led (sin código)
+
+El modelo pasa de PLG a sales-led: no hay signup público; el SUPERADMIN crea tenants + OWNER inicial desde un panel. Los STUDENTS se loguean por DNI. Decisiones cristalizadas en **ADR-012** (sales-led), **ADR-013** (SUPERADMIN como flag en `users`) y **ADR-014** (STUDENTS sin password). Cambios de doc aplicados (sin tocar código):
+
+- `docs/02-dominio.md`: tabla `users` (agrega `is_superadmin`, `must_change_password`, `dni`, `password_hash`/`tenant_id` nullables, constraints e índice parcial único); glosario (agrega SUPERADMIN); jerarquía; flujos F0 (bootstrap CLI), F1 (sales-led), F2 (TRAINER con password generada), F3 (STUDENT por DNI sin password).
+- `docs/03-multi-tenancy.md`: sección "Superadmin" al inicio; nuevo subdominio reservado `superadmin`; tabla de routing actualizada (sin `app.rutinex.app`, con `superadmin.rutinex.app`); casos borde rehechos; nota de `TENANT_INACTIVE` en login; el `TenantGuard` skipea `/superadmin/*`.
+- `docs/04-auth.md`: reescrito. Sin `POST /auth/signup`. Login resuelve por host; nuevo `POST /auth/student-login`; `POST /auth/change-password` con modos forzado y voluntario; JWT payload nuevo (`{ sub, tenantId, role, isSuperadmin }`); política de password generada; bootstrap del SUPERADMIN por CLI; sin magic links / activation tokens.
+- `docs/05-api-conventions.md`: rutas `/superadmin/*` no llevan tenant scoping; queries que no filtran por `tenant_id` deben considerar SUPERADMINs (`tenant_id IS NULL`). Códigos de error: agregados `TENANT_INACTIVE` y `USER_INACTIVE`.
+- `docs/06-frontend-conventions.md`: estructura de carpetas con `superadmin/` y `t/[slug]/{login,change-password}/`; tabla de routing sin `app.rutinex.app`, con `superadmin.rutinex.app`; flujos de auth (login del tenant con tabs Staff/Alumno; login del SUPERADMIN; guard de `mustChangePassword` a nivel layout). `NEXT_PUBLIC_CONTACT_WHATSAPP` en `env`.
+- `docs/07-roadmap.md`: eliminado Step 7 viejo ("Auth: signup OWNER + tenant"). Nuevo **Step 7** = "Superadmin: schema + seed CLI + login básico". **Step 8** reescrito = login normal + `student-login` + `change-password` + rechazo por `is_active=false`. Nuevo **Step 13** = "Panel superadmin (backend)". Renumerado el resto (Step 13 viejo Exercises → Step 14; etc.). Nuevo **Step 28** = "Frontend del SUPERADMIN". Step 5 (`User entity`) ya pide migración con `is_superadmin`, `must_change_password`, `dni`, `password_hash`/`tenant_id` nullables y el índice parcial único, todo en una sola pasada.
+- `docs/08-decisiones.md`: agregados ADR-012, ADR-013, ADR-014 (los números 010 y 011 ya estaban tomados por decisiones previas — error shape y subdomain routing — así que la numeración pedida en la conversación se mantiene consecutiva con +2).
+
+Pendiente para el próximo step: implementar Step 5 con el schema nuevo desde el principio (no se generan migraciones intermedias para el modelo viejo porque el código todavía no lo refleja).
 
 ## Pasos completados
 
@@ -74,7 +90,7 @@ Notas:
 `TenantsModule` en `apps/api/src/modules/tenants/` con:
 
 - `TenantsService` con `create(dto)` y `findBySlug(slug)`. Tira `ConflictException` con `code: 'SLUG_RESERVED' | 'SLUG_TAKEN'` (409) y `NotFoundException` con `code: 'TENANT_NOT_FOUND'` (404). `findBySlug` también devuelve 404 si `is_active=false` (no filtra existencia, ver `docs/03-multi-tenancy.md`).
-- `TenantsController` expone `POST /tenants` (público; lo va a usar signup en Step 7) y `GET /tenants/by-slug/:slug` (devuelve solo `{ id, slug, name, branding }`).
+- `TenantsController` expone `POST /tenants` (público; al momento de Step 4 se previó para signup, pero el modelo cambió a sales-led en el cambio de doc de 2026-05-17 — en Step 13 este endpoint se mueve bajo `POST /superadmin/tenants` con `SuperadminGuard`) y `GET /tenants/by-slug/:slug` (devuelve solo `{ id, slug, name, branding }`).
 - DTOs con `class-validator`: `CreateTenantDto` valida slug (regex + longitud 3–63), name (1–255) y `BrandingDto` opcional (`primaryColor`, `accentColor`, `logoUrl`).
 - Reservados y reglas de slug en `apps/api/src/modules/tenants/slug.ts` (`SLUG_REGEX`, `SLUG_MIN_LENGTH`, `SLUG_MAX_LENGTH`, `RESERVED_SLUGS`). Sincronizado con `docs/03-multi-tenancy.md`.
 
@@ -138,7 +154,7 @@ Notas:
 
 ## Próxima acción concreta
 
-Step 5 — Entity User + módulo Users. Criterios y detalle en `docs/07-roadmap.md`.
+Step 5 — Entity User + módulo Users (con el schema ya alineado a sales-led: `is_superadmin`, `must_change_password`, `dni`, `password_hash` y `tenant_id` nullables, índice parcial único para email de SUPERADMINs). Criterios y detalle en `docs/07-roadmap.md` (renumerado).
 
 ## Pendientes / deudas técnicas
 
@@ -146,9 +162,11 @@ _(vacío — `baseUrl` deprecado quedó saldado en Step 2.)_
 
 ## Decisiones pendientes (necesitan input humano)
 
-- **Plan de billing**: si es mensual fijo por trainer o por alumno activo. No es bloqueante hasta fase 2 (step ~28+).
+- **Modelo de onboarding**: ya decidido. Cambió de PLG a sales-led — ver ADR-012, ADR-013, ADR-014.
+- **Plan de billing**: si es mensual fijo por trainer o por alumno activo. No es bloqueante hasta fase 2.
 - **Custom domains**: si y cuándo soportar `app.gimnasioX.com.ar` apuntando a Rutinex. Diferido.
 - **Catálogo global de ejercicios**: en MVP cada tenant tiene su catálogo. Si más adelante queremos un catálogo curado por nosotros, hay que pensar el merge. Diferido.
+- **`POST /users/:id/reset-password`**: si va como una sola ruta con autorización por jerarquía (OWNER → TRAINER del mismo tenant; SUPERADMIN → OWNER) o si el reset de OWNER va separado bajo `/superadmin/...`. Decidir en Step 12 / Step 13.
 
 ## Notas para retomar
 

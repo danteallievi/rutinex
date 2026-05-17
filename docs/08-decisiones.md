@@ -235,7 +235,7 @@ Lock de versiones mayores. Se sube major solo con justificación explícita en A
 - Private folder (`_t`) en el App Router. Las private folders quedan fuera del routing por diseño; tampoco se pueden alcanzar con rewrite.
 - Prefijo real en URL: `/t/:slug/...` para tenants, `/admin/...` para admin, `/` para marketing. Las route groups se usan solo como agrupación de layouts dentro de cada prefix.
 
-**Decisión**: prefijo real. El middleware reescribe `<slug>.host/...` → `/t/:slug/...` (y, cuando llegue Step 20, `app.host/...` → `/admin/...`).
+**Decisión**: prefijo real. El middleware reescribe `<slug>.host/...` → `/t/:slug/...` (y, cuando llegue Step 21, `superadmin.host/...` → `/superadmin/...`; el subdominio `app.rutinex.app` originalmente previsto fue eliminado con el cambio a sales-led — ver ADR-012).
 
 **Razón**:
 
@@ -248,6 +248,97 @@ Lock de versiones mayores. Se sube major solo con justificación explícita en A
 - El layout del tenant vive en `apps/web/app/t/[slug]/layout.tsx` (cuando se cree), no en `(student)/layout.tsx`.
 - Si en el futuro queremos un path público `/t` real (improbable), hay colisión: habría que renombrar el prefijo a algo más feo.
 - `docs/06-frontend-conventions.md` quedó alineado con esta decisión.
+
+---
+
+## ADR-012 — Onboarding sales-led, no PLG
+
+**Contexto**: el diseño original asumía signup público (PLG): cualquiera entraba a `rutinex.app/signup`, elegía un slug, ponía email y password, y arrancaba un tenant en modo `trial`. La realidad operativa de Rutinex hoy es otra: el vendedor (Dante) cierra ventas cara a cara con gimnasios y PTs locales, cobra fuera del sistema (transferencia / efectivo) y necesita controlar quién entra y con qué slug.
+
+**Opciones**:
+
+- **A. Mantener signup público (PLG)**: landing con form, validación de slug y email en signup, trial automático, billing integrado más adelante. Buena UX para descubrir el producto orgánicamente; necesita anti-abuso (verificación de email, slug reservado por dominio del email, captcha), tiene riesgo de squatting de slugs y de cargar tenants sin venta cerrada.
+- **B. Onboarding manual por SUPERADMIN (sales-led)**: no hay form público; los tenants los crea el SUPERADMIN desde un panel después de cerrar venta. La landing es comercial con CTA a WhatsApp. Sin trial automático.
+- **C. Híbrido**: signup público pero todos los tenants empiezan inactivos hasta que el SUPERADMIN los aprueba manualmente. Combina lo peor de los dos (form público con anti-abuso + paso manual igual).
+
+**Decisión**: **B — sales-led, manual por SUPERADMIN**.
+
+**Razón**:
+
+- El negocio hoy es local y de boca en boca; la cantidad de tenants es chica y manejable a mano.
+- Cobrar antes de dar acceso elimina la deuda y el riesgo de impago.
+- Control absoluto sobre el slug (sin colisiones por carrera de signup ni squatting).
+- Cero anti-abuso para construir en MVP (sin captcha, sin verificación de email, sin lógica de trial).
+- El cliente final no es técnico (gym owners, PTs); el contacto humano por WhatsApp es lo que esperan, no un form de SaaS.
+
+**Consecuencias**:
+
+- Se elimina `POST /auth/signup`. Login y change-password siguen existiendo.
+- Se elimina el subdominio `app.rutinex.app` como surface separado: OWNER/TRAINER se loguean desde `<slug>.rutinex.app/login`.
+- Aparece el surface `superadmin.rutinex.app` con su login, su panel de tenants y su `SuperadminGuard`.
+- La landing pierde el form de signup; se vuelve comercial con CTA a WhatsApp (`NEXT_PUBLIC_CONTACT_WHATSAPP`). La página `/pricing` se mantiene informativa.
+- Sin self-service hay menos "anchas de descubrimiento" del producto. Aceptable mientras el canal sea venta directa.
+- **Si en el futuro se quiere PLG**: hay que reactivar `/auth/signup`, abrir landing con form, definir validación de slug en signup (regex, reservados, colisión), agregar anti-abuso (captcha o rate limit fuerte), decidir trial period y billing automático. El modelo de datos ya soporta esto (los tenants ya pueden empezar con `is_active=true` desde el día 1).
+
+---
+
+## ADR-013 — SUPERADMIN como flag en `users`, no tabla separada
+
+**Contexto**: con el cambio a sales-led (ADR-012) aparece un rol nuevo, el SUPERADMIN, que vive fuera de cualquier tenant: crea tenants, resetea passwords, edita branding, ve la lista global. Hay dos maneras de modelarlo.
+
+**Opciones**:
+
+- **A. Tabla separada `superadmins`** con su propio login, sus propios refresh tokens (`superadmin_refresh_tokens`), su propia JwtStrategy. Aislación total entre staff y operadores de Rutinex.
+- **B. Flag en `users`**: agregar columna `is_superadmin: boolean DEFAULT false` y permitir `tenant_id IS NULL` cuando ese flag está prendido. Mismo endpoint de login, mismo JWT, mismas refresh tokens, con un `SuperadminGuard` que verifica el flag.
+
+**Decisión**: **B — flag en `users`**.
+
+**Razón**:
+
+- Mínima superficie nueva: una columna, un guard, un endpoint extra (`seed:superadmin`). Ningún módulo de auth duplicado.
+- Reuso completo del flujo de auth: rate limiting, Argon2, refresh tokens, detección de reuso, change-password forzado. Hacer todo eso por separado es invitar a divergencia.
+- El SUPERADMIN es **operador de la plataforma**, conceptualmente "un user más", no un sistema distinto.
+- Si el rol crece (más tipos de operadores: soporte, billing, compliance) se puede modelar con más flags o con un campo `role` reescrito a enum extendido; no se justifica una tabla aparte para 1-3 SUPERADMINs.
+
+**Consecuencias**:
+
+- `users.tenant_id` pasa a **nullable** a nivel tabla. Validación en service: solo NULL cuando `is_superadmin=true`.
+- Hace falta un **índice parcial único** `CREATE UNIQUE INDEX users_email_global_unique ON users(email) WHERE tenant_id IS NULL` para evitar dos SUPERADMINs con el mismo email (el UNIQUE compuesto `(tenant_id, email)` no aplica porque Postgres trata `NULL != NULL`).
+- Queries que **no** filtran por `tenant_id` (joins globales, scripts, agregaciones) verán también filas de SUPERADMIN. Hay que excluirlos explícitamente cuando se busca "users finales". Documentado en `docs/05-api-conventions.md` y `docs/03-multi-tenancy.md`.
+- `refresh_tokens.tenant_id` también pasa a nullable (tokens de SUPERADMIN no tienen tenant).
+- **No** se usan magic links ni activation tokens para el primer login: la password generada + `must_change_password` cumple ese rol y mantiene el modelo simple (sin tabla `activation_tokens`).
+- Si el rol crece (auditoría/compliance separadas, permisos finos), reevaluar tabla aparte y/o RBAC explícito.
+
+---
+
+## ADR-014 — STUDENTS sin password, login por DNI
+
+**Contexto**: los STUDENTS son alumnos finales (clientes del gimnasio o PT). Demográficamente: muchos no son técnicos, varios son adultos mayores, algunos no tienen email propio. Pedirles que recuerden una password generada por el sistema (o que la cambien la primera vez) es fricción real que se ve reflejada en "no me funciona, no puedo entrar" al TRAINER. La app no maneja datos sensibles del alumno: no hay pagos, no hay datos médicos, no hay PII más allá de nombre/apellido/DNI. Lo único que el alumno hace es ver su rutina y registrar reps/peso.
+
+**Opciones**:
+
+- **A. Password generada igual que el staff**: el TRAINER al crear el alumno recibe la password, se la pasa. El alumno cambia password en el primer login (`must_change_password=true`). Consistente con el resto de la auth.
+- **B. DNI + factor extra** (fecha de nacimiento, código de 4 dígitos del TRAINER, etc.): un poco más seguro que solo DNI, pero igual de friccional. No hay un factor extra que no sea adivinable o pedible al TRAINER por WhatsApp.
+- **C. Solo DNI dentro del subdominio del tenant**: cero passwords para el alumno; el "secreto" es saber el slug del tenant + el DNI del alumno.
+
+**Decisión**: **C — solo DNI dentro del subdominio del tenant**.
+
+**Razón**:
+
+- UX dramáticamente mejor para el público objetivo. "Entrá a `olimpo.rutinex.app` y poné tu DNI" se explica en una frase.
+- El daño potencial está acotado: el peor escenario realista es que alguien que conozca el DNI de otro alumno (compañero de gym, ex pareja) entre y modifique series/reps de la rutina. No hay datos sensibles que filtrar ni transacciones que ejecutar.
+- Es coherente con cómo operan hoy los gimnasios (acceso por nombre, sin credenciales).
+- Si el alcance crece (datos médicos, pagos, mediciones corporales sensibles, mensajería privada con el TRAINER), se revisa este ADR y se agrega password / factor extra para STUDENTS.
+
+**Consecuencias**:
+
+- `users.password_hash` pasa a **nullable** a nivel tabla. Validación en service: NULL solo cuando `role='STUDENT'`.
+- `users.must_change_password` no aplica a STUDENTS (siempre `false`).
+- `users.dni` pasa a estar **siempre presente para STUDENTS** (validado en service). UNIQUE compuesto con `tenant_id`.
+- Endpoint separado `POST /auth/student-login` con `{ dni }` (slug del subdominio). El login de staff (`POST /auth/login`) sigue pidiendo email + password.
+- El frontend del tenant tiene dos modos en `/login`: tab "Staff" (email + password) y tab "Soy alumno" (solo DNI).
+- Riesgo identificado y aceptado: enumeración de DNIs. Mitigación mínima: rate limiting en `/auth/student-login` por IP + slug. Mensajes genéricos (no decir "DNI no existe" vs "DNI inactivo").
+- Si el riesgo crece, opciones futuras: PIN de 4 dígitos seteable por el TRAINER, fecha de nacimiento como segundo factor, magic link al WhatsApp del alumno.
 
 ---
 

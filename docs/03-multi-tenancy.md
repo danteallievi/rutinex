@@ -1,10 +1,21 @@
 # 03 — Multi-tenancy
 
+## Superadmin (fuera del modelo multi-tenant)
+
+Existe un rol especial — **SUPERADMIN** — que vive afuera del modelo multi-tenant: nosotros, los operadores de Rutinex. Se identifica por `users.is_superadmin = true` y `users.tenant_id IS NULL` (sin tabla separada, ver ADR-013).
+
+- Vive en su propio surface: subdominio `superadmin.rutinex.app` (rewrite cableado en Step 21 del roadmap; panel completo en Step 28).
+- Sus rutas (`/superadmin/*` en el API) **no** pasan por el `TenantGuard` y **no** requieren header `x-tenant-slug`. Las protege un `SuperadminGuard` que verifica `req.user.isSuperadmin === true`.
+- El JWT del SUPERADMIN tiene `tenantId: null` y `isSuperadmin: true`. Mismo secreto, mismas refresh tokens que los users de tenant.
+- El primer SUPERADMIN se crea por CLI (`pnpm --filter api seed:superadmin`). Ver `docs/04-auth.md`.
+
+Todo lo de abajo aplica a los users de tenant (OWNER, TRAINER, STUDENT). Los SUPERADMINs son una excepción explícita.
+
 ## Estrategia
 
 **Shared database, shared schema, `tenant_id` discriminator column.**
 
-Toda tabla del dominio (excepto `tenants` mismo) tiene una columna `tenant_id` NOT NULL con un FK a `tenants.id` e índice. Todo query la filtra. Punto.
+Toda tabla del dominio (excepto `tenants` y los SUPERADMINs en `users`) tiene una columna `tenant_id` NOT NULL con un FK a `tenants.id` e índice. Todo query la filtra. Punto.
 
 Por qué no schema-per-tenant o DB-per-tenant: para arrancar es caro de operar, complica migraciones (hay que aplicarlas N veces), encarece la infra. Cuando un cliente grande lo pida (compliance, aislamiento real), evaluamos schema-per-tenant para ese cliente específico. No se diseña para un caso que no existe.
 
@@ -26,18 +37,20 @@ Vercel acepta wildcard domains en planes pagos; alternativamente, agregamos los 
 
 El middleware extrae el slug del subdominio (helper en `apps/web/lib/subdomain.ts`) y **reescribe** la URL al prefijo real `/t/:slug/...`. La detección no llama al API: deja pasar la request y el server component del tenant (`app/t/[slug]/page.tsx`) es el que valida existencia contra `GET /tenants/by-slug/:slug` y dispara `notFound()` si el API responde 404.
 
-Casos (post-implementación de Step 4.5):
+Casos (post-implementación de Step 4.5 + cambio a sales-led):
 
-| Host                      | Slug        | Resultado                                       |
-| ------------------------- | ----------- | ----------------------------------------------- |
-| `rutinex.app`             | —           | sin rewrite → landing en `/`                    |
-| `www.rutinex.app`         | —           | reservado → landing                             |
-| `app.rutinex.app`         | —           | reservado → admin (Step 20+, todavía sin rutas) |
-| `olimpo.rutinex.app`      | olimpo      | rewrite `/...` → `/t/olimpo/...`                |
-| `olimpo.rutinex.app/foo`  | olimpo      | rewrite `/foo` → `/t/olimpo/foo`                |
-| `inexistente.rutinex.app` | inexistente | rewrite a `/t/inexistente`; la page tira 404    |
+| Host                      | Slug        | Resultado                                                                                 |
+| ------------------------- | ----------- | ----------------------------------------------------------------------------------------- |
+| `rutinex.app`             | —           | sin rewrite → landing comercial en `/` (CTA WhatsApp, sin signup)                         |
+| `www.rutinex.app`         | —           | reservado → landing                                                                       |
+| `superadmin.rutinex.app`  | —           | reservado → surface `(superadmin)`: login propio + panel para SUPERADMIN                  |
+| `olimpo.rutinex.app`      | olimpo      | rewrite `/...` → `/t/olimpo/...`. Si sin auth → login del tenant. Auth → admin o student. |
+| `olimpo.rutinex.app/foo`  | olimpo      | rewrite `/foo` → `/t/olimpo/foo`                                                          |
+| `inexistente.rutinex.app` | inexistente | rewrite a `/t/inexistente`; la page tira 404                                              |
 
-Reservados (`www`, `app`) y patrones de host que no matchean `*.localhost` / `*.rutinex.app` no se tratan como tenant. Ver código en `apps/web/lib/subdomain.ts`.
+> Cambio respecto al diseño original: el subdominio `app.rutinex.app` **dejó de existir como surface**. Antes era el host del panel admin; ahora OWNER/TRAINER se loguean desde el subdominio de su propio tenant. Esto unifica auth en un solo flujo por tenant y elimina la ambigüedad de email entre tenants. Ver ADR-012.
+
+Reservados (`www`, `superadmin`) y patrones de host que no matchean `*.localhost` / `*.rutinex.app` no se tratan como tenant. Ver código en `apps/web/lib/subdomain.ts`.
 
 Por qué reescribir a un prefijo real y no a una route group (`(student)/`): las route groups del App Router son organizativas y no aparecen en el URL path, así que `NextResponse.rewrite` no puede apuntarles. Detalle en ADR-011.
 
@@ -46,29 +59,32 @@ Por qué reescribir a un prefijo real y no a una route group (`(student)/`): las
 Chrome y Firefox resuelven `*.localhost` automáticamente. No hace falta tocar `/etc/hosts`. Si en Safari aparece algún problema, usar `*.lvh.me` o `*.localtest.me` como host alternativo (todos resuelven a `127.0.0.1`).
 
 ```
-http://localhost:3000               → landing
-http://olimpo.localhost:3000        → tenant "olimpo" (rewrite a /t/olimpo)
-http://www.localhost:3000           → landing (reservado)
-http://inexistente.localhost:3000   → 404 "Este gimnasio no existe"
+http://localhost:3000                   → landing (CTA WhatsApp, sin signup)
+http://olimpo.localhost:3000            → tenant "olimpo" (rewrite a /t/olimpo)
+http://www.localhost:3000               → landing (reservado)
+http://superadmin.localhost:3000        → surface (superadmin) (reservado)
+http://inexistente.localhost:3000       → 404 "Este gimnasio no existe"
 ```
 
 ### CORS
 
-En dev, el API (`apps/api/src/main.ts`) habilita CORS con regex para `localhost` y `*.localhost` en cualquier puerto. Esto cubre el flujo de signup en la landing (`localhost:3000`) y los fetches server-side de la página del tenant (`<slug>.localhost:3000`).
+En dev, el API (`apps/api/src/main.ts`) habilita CORS con regex para `localhost` y `*.localhost` en cualquier puerto. Esto cubre las llamadas desde la landing (`localhost:3000`), el panel SUPERADMIN (`superadmin.localhost:3000`) y los fetches server-side de la página del tenant (`<slug>.localhost:3000`).
 
-En prod (Step 27) el origin se restringe a `rutinex.app` y `*.rutinex.app`.
+En prod (Step 29) el origin se restringe a `rutinex.app` y `*.rutinex.app`.
 
 ### Validación en el API
 
-El frontend manda `x-tenant-slug: olimpo` en cada request al API. El API tiene un `TenantGuard` global que:
+El frontend manda `x-tenant-slug: olimpo` en cada request al API que vive en contexto de tenant. El API tiene un `TenantGuard` global que:
 
-1. Si la ruta es pública (signup, login del owner desde landing, healthcheck), no hace nada.
-2. Si la ruta es autenticada:
+1. Si la ruta es pública (login, student-login, healthcheck) o `/superadmin/*` (que tiene su propio `SuperadminGuard`), no hace nada.
+2. Si la ruta es autenticada y vive en contexto de tenant:
    a. Extrae `userId` y `tenantId` del JWT.
    b. Lee `x-tenant-slug` del header.
    c. Carga el tenant por slug y compara `tenant.id === jwt.tenantId`.
    d. Si no coincide → `403 Forbidden`. (Defensa contra alguien que se logueó en un tenant y trata de pegarle a otro.)
    e. Inyecta `tenantId` en el `Request` para que los services lo usen.
+
+Las rutas `/superadmin/*` no necesitan `x-tenant-slug` (operan cross-tenant), no pasan por `TenantGuard`, y exigen `req.user.isSuperadmin === true` vía `SuperadminGuard`.
 
 ## Filtrado automático en queries
 
@@ -124,17 +140,19 @@ Las utilities Tailwind correspondientes (`bg-brand-primary`, `text-brand-primary
 
 - Match: `^[a-z0-9]+(-[a-z0-9]+)*$` (DNS-safe).
 - Mínimo 3 caracteres, máximo 63 (DNS label max). El entity (`apps/api/src/modules/tenants/entities/tenant.entity.ts`) usa `varchar(63)`.
-- Reservados (chocan con superficies propias del producto y se rechazan en `POST /tenants` con 409 `SLUG_RESERVED`):
-  `admin`, `api`, `app`, `assets`, `auth`, `docs`, `help`, `mail`, `rutinex`, `static`, `status`, `support`, `www`.
+- Reservados (chocan con superficies propias del producto y se rechazan en `POST /superadmin/tenants` con 409 `SLUG_RESERVED`):
+  `admin`, `api`, `app`, `assets`, `auth`, `docs`, `help`, `mail`, `rutinex`, `static`, `status`, `superadmin`, `support`, `www`.
 - Inmutable después de creado. Si un cliente lo quiere cambiar, soporte lo hace manualmente y vemos cómo migrar referencias (rarísimo).
 - Fuente de verdad en código: `apps/api/src/modules/tenants/slug.ts` (constantes + función `isReservedSlug`). El DTO valida regex + longitud (400) y el service valida reservado + colisión (409).
 
 ## Casos borde
 
-- **OWNER se loguea desde `app.rutinex.app`**: el flujo de login en admin pide email + password sin slug. El API busca el `user` por email, encuentra su `tenant_id`, emite JWT con ese `tenant_id`. Si el mismo email existe en varios tenants (raro, pero permitido), se pide que ingresen el slug también.
-- **STUDENT se loguea desde `olimpo.rutinex.app`**: el slug viene del subdominio. El API busca `user` por email + `tenant_id` resuelto desde slug. Más simple.
+- **OWNER o TRAINER se loguea desde `olimpo.rutinex.app/login`**: el slug **siempre** viene del subdominio. El API resuelve `tenant_id` desde el slug y busca `user` por `(tenant_id, email)` con `is_superadmin=false`. No hay ambigüedad cross-tenant porque el slug es parte de la URL.
+- **STUDENT se loguea desde `olimpo.rutinex.app/login`** (tab "Soy alumno"): mismo slug del subdominio, endpoint `POST /auth/student-login` con `{ dni }`. Ver `docs/04-auth.md`.
 - **STUDENT entra a un slug que no existe**: 404 con página genérica.
-- **STUDENT entra a `olimpo.rutinex.app` con un JWT de otro tenant**: el `TenantGuard` lo rechaza. El frontend lo desloguea y lo manda al login de `olimpo`.
+- **User entra a `olimpo.rutinex.app` con un JWT de otro tenant**: el `TenantGuard` lo rechaza. El frontend lo desloguea y lo manda al login de `olimpo`.
+- **Tenant inactivo (`is_active=false`)**: **rechazo total al login**. Tanto `POST /auth/login` como `POST /auth/student-login` devuelven `403 tenant inactive` con mensaje "Tu cuenta está pausada. Contactá a tu vendedor por WhatsApp." Ningún user del tenant entra — ni OWNER. El SUPERADMIN sigue pudiendo reactivar el tenant desde su panel.
+- **SUPERADMIN intenta loguearse desde un subdominio de tenant** (o un user de tenant intenta loguearse desde `superadmin.rutinex.app`): el backend devuelve `401 invalid credentials` genérico, sin filtrar la existencia del user. Cada host tiene su propio criterio de búsqueda: `superadmin` busca `is_superadmin=true`; los demás buscan `(tenant_id=resolved, is_superadmin=false)`.
 
 ## Lo que se evita
 

@@ -2,22 +2,26 @@
 
 ## Glosario
 
-| Término                  | Definición                                                                                               |
-| ------------------------ | -------------------------------------------------------------------------------------------------------- |
-| **Tenant**               | Una unidad comercial: un gimnasio, un personal trainer, una red de gyms.                                 |
-| **OWNER**                | Usuario dueño del tenant. Paga la suscripción. Puede haber TRAINERS bajo él.                             |
-| **TRAINER**              | Entrenador que opera dentro del tenant. Arma rutinas, da de alta alumnos.                                |
-| **STUDENT**              | Alumno final que entrena. Vive bajo un tenant.                                                           |
-| **Ejercicio**            | Una unidad de movimiento (ej. "Press de banca"). Tiene título, descripción y media. Pertenece al tenant. |
-| **Rutina**               | Conjunto ordenado de ejercicios con series/reps/peso prescritos.                                         |
-| **Asignación**           | Vínculo entre una rutina y un alumno, con fecha de vigencia.                                             |
-| **Sesión**               | Instancia de ejecución de una rutina asignada por parte de un alumno, en una fecha.                      |
-| **Set**                  | Un set concreto que el alumno ejecutó dentro de una sesión, con reps y peso reales.                      |
-| **PR (Personal Record)** | Mejor marca de un alumno en un ejercicio dado. Se deriva del histórico de sets.                          |
+| Término                  | Definición                                                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| **Tenant**               | Una unidad comercial: un gimnasio, un personal trainer, una red de gyms.                                                        |
+| **SUPERADMIN**           | Operador de Rutinex (nosotros). Vive fuera de cualquier tenant. Da de alta tenants y OWNERs, resetea passwords, edita branding. |
+| **OWNER**                | Usuario dueño del tenant. Paga la suscripción. Puede haber TRAINERS bajo él.                                                    |
+| **TRAINER**              | Entrenador que opera dentro del tenant. Arma rutinas, da de alta alumnos.                                                       |
+| **STUDENT**              | Alumno final que entrena. Vive bajo un tenant. Se loguea por DNI, sin password.                                                 |
+| **Ejercicio**            | Una unidad de movimiento (ej. "Press de banca"). Tiene título, descripción y media. Pertenece al tenant.                        |
+| **Rutina**               | Conjunto ordenado de ejercicios con series/reps/peso prescritos.                                                                |
+| **Asignación**           | Vínculo entre una rutina y un alumno, con fecha de vigencia.                                                                    |
+| **Sesión**               | Instancia de ejecución de una rutina asignada por parte de un alumno, en una fecha.                                             |
+| **Set**                  | Un set concreto que el alumno ejecutó dentro de una sesión, con reps y peso reales.                                             |
+| **PR (Personal Record)** | Mejor marca de un alumno en un ejercicio dado. Se deriva del histórico de sets.                                                 |
 
 ## Roles y jerarquía
 
 ```
+SUPERADMIN (User con is_superadmin=true, tenant_id=NULL)
+  │  (fuera de cualquier tenant; opera el panel /superadmin)
+  ▼
 Tenant (olimpo)
   └── User (OWNER, paga la suscripción)
         ├── User (TRAINER)
@@ -30,6 +34,7 @@ Tenant (olimpo)
 
 **Notas**:
 
+- El **SUPERADMIN** vive arriba del árbol y es independiente del modelo multi-tenant. No tiene tenant. Se identifica por el flag `users.is_superadmin = true` (sin tabla separada — ver ADR-013).
 - En el MVP, el OWNER puede ser también el TRAINER (caso PT individual). Esto se modela con un solo `User` que tiene ambos roles.
 - Un STUDENT pertenece a un TRAINER específico dentro del tenant. Si un tenant tiene 3 trainers, cada alumno está asignado a uno.
 
@@ -52,21 +57,32 @@ Tenant (olimpo)
 
 ### `users`
 
-| Campo           | Tipo             | Notas                                                                                     |
-| --------------- | ---------------- | ----------------------------------------------------------------------------------------- |
-| `id`            | uuid PK          |                                                                                           |
-| `tenant_id`     | uuid FK          | Index. Todo user pertenece a un tenant.                                                   |
-| `email`         | varchar          | UNIQUE compuesto con `tenant_id` (mismo email puede existir en distintos tenants).        |
-| `password_hash` | varchar          | Argon2.                                                                                   |
-| `first_name`    | varchar          |                                                                                           |
-| `last_name`     | varchar          |                                                                                           |
-| `dni`           | varchar          | Documento. Nullable para OWNER/TRAINER, obligatorio para STUDENT. UNIQUE con `tenant_id`. |
-| `role`          | enum             | `OWNER`, `TRAINER`, `STUDENT`. Un user puede tener un solo rol en MVP.                    |
-| `trainer_id`    | uuid FK nullable | Solo para STUDENT: a qué trainer pertenece.                                               |
-| `is_active`     | boolean          | El "prender/apagar" del entrenador hacia el alumno.                                       |
-| `last_login_at` | timestamptz      | Nullable.                                                                                 |
-| `created_at`    | timestamptz      |                                                                                           |
-| `updated_at`    | timestamptz      |                                                                                           |
+| Campo                  | Tipo             | Notas                                                                                                                         |
+| ---------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `id`                   | uuid PK          |                                                                                                                               |
+| `tenant_id`            | uuid FK nullable | Index. NOT NULL para users de tenant; NULL **solo** para `is_superadmin=true`. Validado en service.                           |
+| `email`                | varchar nullable | UNIQUE compuesto con `tenant_id` para staff. NULL permitido para STUDENTS. Mismo email puede existir en distintos tenants.    |
+| `password_hash`        | varchar nullable | Argon2id. NULL para STUDENTS (login por DNI, ver ADR-014). NOT NULL para OWNER/TRAINER/SUPERADMIN, validado en service.       |
+| `must_change_password` | boolean          | Default `false`. Se setea `true` cuando el sistema generó la password (alta de OWNER/TRAINER, reset). No aplica a STUDENTS.   |
+| `is_superadmin`        | boolean          | Default `false`. Si `true`, `tenant_id` debe ser NULL y `role` se ignora.                                                     |
+| `first_name`           | varchar          |                                                                                                                               |
+| `last_name`            | varchar          |                                                                                                                               |
+| `dni`                  | varchar(20)      | Documento. NULL permitido a nivel tabla; **requerido** para STUDENTS (validado en service). UNIQUE compuesto con `tenant_id`. |
+| `role`                 | enum nullable    | `OWNER`, `TRAINER`, `STUDENT`. NULL para SUPERADMIN. Un user no-superadmin tiene exactamente un rol en MVP.                   |
+| `trainer_id`           | uuid FK nullable | Solo para STUDENT: a qué trainer pertenece.                                                                                   |
+| `is_active`            | boolean          | El "prender/apagar" del entrenador hacia el alumno (o del OWNER hacia un TRAINER).                                            |
+| `last_login_at`        | timestamptz      | Nullable.                                                                                                                     |
+| `created_at`           | timestamptz      |                                                                                                                               |
+| `updated_at`           | timestamptz      |                                                                                                                               |
+
+**Constraints e índices**:
+
+- `UNIQUE (tenant_id, email)` para staff con email — Postgres permite múltiples filas con `(tenant_id=X, email=NULL)` porque trata `NULL != NULL`, lo cual aplica naturalmente a STUDENTS sin email.
+- `UNIQUE (tenant_id, dni)` para students.
+- `CREATE UNIQUE INDEX users_email_global_unique ON users(email) WHERE tenant_id IS NULL` — índice parcial único para emails de SUPERADMINs (sin él, el UNIQUE compuesto no aplica porque `tenant_id IS NULL`).
+- Si en algún momento aparece DNI sin tenant (no existe hoy), repetir el patrón con un índice parcial.
+
+**Consecuencia importante**: queries que **no** filtran por `tenant_id` (joins globales, scripts, agregaciones) verán también filas con `tenant_id IS NULL` (SUPERADMINs). Excluirlos explícitamente cuando corresponda (`WHERE is_superadmin = false` o `WHERE tenant_id IS NOT NULL`). Las queries que sí filtran por `tenant_id = $X` los excluyen naturalmente.
 
 ### `exercises`
 
@@ -211,25 +227,38 @@ personal_records >── exercises, sets
 
 ## Flujos principales
 
-### F1 — Onboarding de tenant + OWNER
+### F0 — Bootstrap del SUPERADMIN (una vez por entorno)
 
-1. OWNER se registra desde landing pública (`rutinex.app/signup`): nombre del gym, slug deseado, email, password.
-2. API valida que el slug matchee las reglas de `docs/03-multi-tenancy.md` (regex, longitud, no reservado) y que no esté tomado.
-3. Se crea `tenant` (status `trial`) + `user` con role `OWNER`.
-4. Email de confirmación (fase 2).
-5. OWNER puede ya entrar a `<slug>.rutinex.app/admin`.
+1. Operador corre `pnpm --filter api seed:superadmin` y tipea email + password por stdin.
+2. El script crea un `user` con `is_superadmin=true`, `tenant_id=NULL`, `password_hash` (Argon2) de la password tipeada, `must_change_password=false` (la escribiste vos, ya es tuya), `role=NULL`.
+3. Login desde `superadmin.rutinex.app/login` con ese par.
+
+> El modelo es **sales-led, no PLG**: no hay signup público. Los tenants los crea el SUPERADMIN después de cerrar la venta cara a cara y cobrar afuera del sistema. Ver ADR-012.
+
+### F1 — Onboarding sales-led (tenant + OWNER por SUPERADMIN)
+
+1. SUPERADMIN cierra venta con un gimnasio o PT. Cobra fuera del sistema.
+2. Desde el panel `superadmin.rutinex.app`, el SUPERADMIN llena: nombre del gym, slug deseado, branding inicial (opcional), email + nombre + apellido del OWNER.
+3. API valida que el slug matchee las reglas de `docs/03-multi-tenancy.md` (regex, longitud, no reservado) y que no esté tomado.
+4. En **una sola transacción**: crea `tenant` (`is_active=true`) + `user` con `role=OWNER`, password generada por el sistema (16 chars, alfabeto `[a-zA-Z0-9]` sin `0/O/o/1/l/I`) hasheada con Argon2, `must_change_password=true`.
+5. La response devuelve la password en plano **una sola vez** (no se loggea, no se guarda).
+6. SUPERADMIN pasa la password al OWNER por WhatsApp.
+7. OWNER entra a `<slug>.rutinex.app/login` con su email + password generada. Login devuelve `mustChangePassword: true`. Frontend redirige a `/change-password` (modo forzado). OWNER setea una password propia y queda con `must_change_password=false`.
+8. A partir de ahí, OWNER usa `<slug>.rutinex.app/admin`.
 
 ### F2 — Alta de TRAINER por OWNER
 
-1. OWNER invita un TRAINER desde `<slug>.rutinex.app/admin/team` con email y nombre.
-2. API crea `user` con role `TRAINER`, `is_active=true`, password temporal.
-3. Se le manda email con link de set-password (fase 2: por ahora se le da la pass al OWNER en respuesta).
+1. OWNER invita un TRAINER desde `<slug>.rutinex.app/admin/team` con email, nombre y apellido.
+2. API crea `user` con `role=TRAINER`, `is_active=true`, password generada (misma política que F1), `must_change_password=true`.
+3. La response devuelve la password en plano **una sola vez**.
+4. OWNER se la pasa al TRAINER por el canal que prefiera (WhatsApp). En el primer login, TRAINER pasa por `/change-password` forzado.
 
-### F3 — Alta de STUDENT por TRAINER
+### F3 — Alta de STUDENT por TRAINER (sin password)
 
-1. TRAINER desde su panel ingresa: DNI, nombre, apellido, email.
-2. API crea `user` con role `STUDENT`, `trainer_id` = el trainer logueado, `is_active=true`, password generada.
-3. Se le da al TRAINER las credenciales para pasarle al alumno (fase 2: invitación por mail/WhatsApp).
+1. TRAINER desde su panel ingresa: DNI, nombre, apellido. Email es opcional.
+2. API valida que el DNI no esté tomado dentro del tenant.
+3. API crea `user` con `role=STUDENT`, `trainer_id` = el trainer logueado, `is_active=true`, `password_hash=NULL`, `must_change_password=false`.
+4. No hay credencial que entregar: el STUDENT se loguea con su DNI dentro del subdominio del tenant (ver ADR-014).
 
 ### F4 — Creación de rutina y asignación
 

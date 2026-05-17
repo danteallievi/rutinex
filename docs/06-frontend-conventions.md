@@ -9,46 +9,60 @@ Mobile-first. shadcn/ui como base. Tailwind para todo. Server Components por def
 ```
 apps/web/
 ├── app/
-│   ├── page.tsx              # rutinex.app — landing pública
-│   ├── signup-form.tsx       # 'use client' — form del landing
+│   ├── page.tsx              # rutinex.app — landing comercial (CTA WhatsApp, sin signup)
+│   ├── pricing/page.tsx      # /pricing informativa, CTA al mismo WhatsApp
 │   ├── layout.tsx            # root layout (theme dark, fuentes)
 │   ├── globals.css
 │   ├── t/                    # tenants — destino del rewrite del middleware
 │   │   └── [slug]/
-│   │       ├── page.tsx      # "Hoy" del alumno (Step 25+); hoy: bienvenida + branding
-│   │       └── not-found.tsx # 404 cuando el slug no existe
-│   ├── admin/                # app.rutinex.app — OWNER / TRAINER (Step 20+)
+│   │       ├── page.tsx      # home del tenant (admin o student según rol logueado)
+│   │       ├── login/        # login del tenant (tab staff por password + tab "Soy alumno" por DNI)
+│   │       ├── change-password/  # forzado/voluntario para OWNER y TRAINER
+│   │       └── not-found.tsx
+│   ├── superadmin/           # superadmin.rutinex.app — destino del rewrite del middleware
+│   │   ├── login/
+│   │   ├── change-password/
+│   │   ├── tenants/          # lista, crear, toggle is_active, reset password OWNER, edit branding
+│   │   └── layout.tsx        # guard: requiere isSuperadmin=true; bloquea si mustChangePassword
 │   └── api/                  # route handlers solo si hace falta (ej. webhooks)
 ├── components/
-│   ├── ui/                   # shadcn/ui generado (Step 20+)
+│   ├── ui/                   # shadcn/ui generado (Step 21+)
 │   └── <dominio>/            # componentes de dominio (RoutineCard, etc.)
 ├── lib/
 │   ├── api-client.ts         # fetch wrapper tipado + ApiClientError
-│   ├── env.ts                # acceso tipado a NEXT_PUBLIC_* con guard
-│   ├── subdomain.ts          # extractTenantSlug(host)
-│   ├── auth.ts               # helpers de auth (cliente) — Step 21+
+│   ├── env.ts                # acceso tipado a NEXT_PUBLIC_* con guard (incluye CONTACT_WHATSAPP)
+│   ├── subdomain.ts          # extractTenantSlug(host), isSuperadminHost(host)
+│   ├── auth.ts               # helpers de auth (cliente) — Step 22+
 │   └── utils.ts
 ├── hooks/
-├── middleware.ts             # routing por subdominio
+├── middleware.ts             # routing por subdominio (tenant | superadmin | landing)
 └── postcss.config.mjs        # Tailwind 4 via @tailwindcss/postcss
 ```
 
 Path alias `@/*` apunta a `apps/web/*` (configurado en `tsconfig.json`).
 
+> Las route groups `(marketing)`, `(admin)`, `(student)`, `(superadmin)` se usan internamente solo para layout-sharing cuando aparezca esa necesidad; los **rewrites del middleware apuntan a prefijos reales** (`/t/:slug/...`, `/superadmin/...`), no a route groups (ver ADR-011).
+
 ## Routing por superficie
 
-La detección de host la hace `middleware.ts` (helper `extractTenantSlug` en `lib/subdomain.ts`). El middleware **reescribe** la URL a un prefijo real, **no** a una route group:
+La detección de host la hace `middleware.ts` (helpers `extractTenantSlug` e `isSuperadminHost` en `lib/subdomain.ts`). El middleware **reescribe** la URL a un prefijo real, **no** a una route group:
 
-| Host                     | Rewrite              | Para qué                    |
-| ------------------------ | -------------------- | --------------------------- |
-| `rutinex.app/...`        | sin rewrite (`/...`) | Landing pública             |
-| `www.rutinex.app/...`    | sin rewrite          | Landing (reservado)         |
-| `app.rutinex.app/...`    | `/admin/...`         | Admin (Step 20+, sin rutas) |
-| `olimpo.rutinex.app/...` | `/t/olimpo/...`      | Tenant                      |
+| Host                         | Rewrite              | Para qué                                                            |
+| ---------------------------- | -------------------- | ------------------------------------------------------------------- |
+| `rutinex.app/...`            | sin rewrite (`/...`) | Landing comercial (CTA WhatsApp, sin signup)                        |
+| `www.rutinex.app/...`        | sin rewrite          | Landing (reservado)                                                 |
+| `superadmin.rutinex.app/...` | `/superadmin/...`    | Surface SUPERADMIN: login propio + panel de tenants                 |
+| `olimpo.rutinex.app/...`     | `/t/olimpo/...`      | Tenant. Login → admin (OWNER/TRAINER) o student (STUDENT) según rol |
 
-Por qué no route groups (`(marketing)/(admin)/(student)`): los paréntesis del App Router son organizativos y no aparecen en el URL, así que `NextResponse.rewrite` no puede apuntarles. Detalle en ADR-011.
+> El subdominio `app.rutinex.app` **dejó de existir** como surface separado. Antes era el host del panel admin; con el cambio a sales-led, OWNER/TRAINER se loguean desde el subdominio de su propio tenant (`<slug>.rutinex.app/login`) y el surface admin se sirve dentro del prefix `/t/<slug>/...`. Ver ADR-012.
 
-Las route groups quedan disponibles como herramienta de layout (compartir `layout.tsx` entre rutas hermanas) cuando aparezca esa necesidad. No están prohibidas, simplemente no se usan para mapear hosts a URLs.
+Cómo se decide qué se sirve dentro del prefix del tenant:
+
+- Sin user logueado en este tenant → página de login del tenant (con tab "Soy alumno" → solo DNI).
+- Logueado con `role=OWNER` o `role=TRAINER` → surface admin (`(admin)` route group para el layout).
+- Logueado con `role=STUDENT` → surface student (`(student)` route group).
+
+Por qué no route groups para el rewrite: los paréntesis del App Router son organizativos y no aparecen en el URL, así que `NextResponse.rewrite` no puede apuntarles. Detalle en ADR-011. Las route groups quedan disponibles como herramienta de layout (compartir `layout.tsx` entre rutas hermanas).
 
 ## Componentes
 
@@ -67,7 +81,7 @@ Patrón: componente "shell" server-side que hace fetch + render, y dentro un cli
 
 Se instalan los componentes a demanda con `pnpm dlx shadcn@latest add button`. Quedan en `components/ui/`. **No** se modifican los archivos shadcn generados directo; si hace falta una variante, se extiende vía `cva`.
 
-> **Estado actual**: el init formal de shadcn (CLI + `components.json`) se difirió al Step 20 para no entreverarlo con la config nueva de Tailwind 4 a mitad del Step 4.5. Hasta entonces, las páginas usan Tailwind directo. Cuando entre Step 20, se inicializa y se refactorizan las que existan.
+> **Estado actual**: el init formal de shadcn (CLI + `components.json`) se difirió al Step 21 para no entreverarlo con la config nueva de Tailwind 4 a mitad del Step 4.5. Hasta entonces, las páginas usan Tailwind directo. Cuando entre Step 21, se inicializa y se refactorizan las que existan.
 
 ### Nuestros componentes
 
@@ -129,15 +143,51 @@ import { env } from '@/lib/env';
 
 env.apiUrl; // NEXT_PUBLIC_API_URL
 env.rootHost; // NEXT_PUBLIC_ROOT_HOST (ej. "localhost:3000" en dev)
+env.contactWhatsapp; // NEXT_PUBLIC_CONTACT_WHATSAPP (número que abre wa.me en la landing)
 ```
 
-`rootHost` es el host raíz sin protocolo: lo usa el form de signup para redirigir al subdominio del tenant recién creado (`http://${slug}.${rootHost}`).
+`rootHost` es el host raíz sin protocolo: lo usa el SUPERADMIN para construir links a subdominios de tenants y el flujo post-login. `contactWhatsapp` lo usa la landing y la página `/pricing` para el CTA "Contactanos por WhatsApp" (`wa.me/${contactWhatsapp}`).
 
 ## Auth (cliente)
 
 - Access token en memoria (React state via Zustand store).
 - Refresh token en cookie httpOnly (la setea el API).
-- Al cargar la app, intentar refresh silencioso. Si falla → la página de login del surface correspondiente.
+- Al cargar la app, intentar refresh silencioso. Si falla → página de login del surface correspondiente.
+
+### Login del tenant (`<slug>.rutinex.app/login`)
+
+- Dos tabs (o link separado): **"Staff"** (OWNER/TRAINER) con email + password, y **"Soy alumno"** (STUDENT) con un solo input de DNI.
+- Staff postea a `POST /auth/login`; alumno postea a `POST /auth/student-login`.
+- Errores específicos a mapear desde `ApiClientError.body.code`:
+  - `TENANT_INACTIVE` → "Tu cuenta está pausada. Contactá a tu vendedor por WhatsApp."
+  - `USER_INACTIVE` → "Tu cuenta está pausada, contactá a tu entrenador."
+  - resto → "Email o contraseña inválidos" / "DNI inválido" (genérico, sin filtrar existencia).
+
+### Login del SUPERADMIN (`superadmin.rutinex.app/login`)
+
+- Email + password. Postea a `POST /auth/login` (mismo endpoint que staff, el backend decide por host).
+- No tiene tab de alumno. No tiene CTA a contacto.
+
+### Primer login con password generada → `/change-password` forzado
+
+Al hacer login, la response trae `user.mustChangePassword: boolean`. Si es `true`:
+
+1. El store de auth guarda el access token igual.
+2. **El layout del surface (admin o superadmin) chequea el flag y, si está prendido, no renderiza children** — renderiza solo el form de `/change-password` (modo forzado) y un mensaje "Por seguridad, cambiá tu contraseña antes de continuar".
+3. El form postea `POST /auth/change-password { newPassword }` (modo forzado: no pide la actual; el JWT autentica).
+4. Cuando vuelve OK, el store actualiza `mustChangePassword=false` y el layout pasa a renderizar children.
+
+> La página `/change-password` también vive en el surface `(superadmin)` por consistencia, aunque hoy un SUPERADMIN bootstrappeado por CLI nunca tendrá el flag prendido. Si en el futuro un SUPERADMIN se crea desde el panel con password generada, el flujo ya está cubierto.
+
+El modo **voluntario** del mismo endpoint (`{ currentPassword, newPassword }`) se usa cuando el user navega a `/change-password` por su cuenta. Si el flag forzado no está prendido, el form pide la password actual.
+
+### Flujo de login del STUDENT (resumen)
+
+1. Va a `<slug>.rutinex.app`, sin auth → redirige a `<slug>.rutinex.app/login`.
+2. Tab "Soy alumno" → ingresa DNI → postea a `POST /auth/student-login`.
+3. Recibe access + refresh, JWT con `role=STUDENT`, `mustChangePassword=false` siempre.
+4. Va a la home `(student)` del tenant.
+5. Si en algún momento `tenant.is_active=false` o `user.is_active=false`, el próximo refresh/llamada al API recibe el `code` correspondiente y el cliente desloguea con el mensaje apropiado.
 
 ## Theming y branding
 

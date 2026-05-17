@@ -64,7 +64,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Hacer**:
 
 - `TenantsModule`, `TenantsService`, `TenantsController`.
-- `POST /tenants` (sin auth todavía, lo abrimos para signup en step 7).
+- `POST /tenants` (sin auth todavía; en Step 13 se mueve bajo `/superadmin/tenants` con `SuperadminGuard`).
 - `GET /tenants/by-slug/:slug` → devuelve `{ id, slug, name, branding }` (público, sin datos sensibles).
 - Validación de slug con regex y reservados (ver `docs/03-multi-tenancy.md`).
 
@@ -74,81 +74,99 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ### Step 4.5 — Interludio visual: multi-tenancy en pantalla
 
-**Objetivo**: meter una mini-superficie web encima de lo que tenemos para ver el flujo multi-tenant funcionando antes de seguir con backend puro. No está en el plan original (la fase 2 era el frontend), pero queremos visceralidad temprana. Adelanta lo mecánico del Step 20 sin tocar auth.
+**Objetivo**: meter una mini-superficie web encima de lo que tenemos para ver el flujo multi-tenant funcionando antes de seguir con backend puro. No está en el plan original (la fase 2 era el frontend), pero queremos visceralidad temprana. Adelanta lo mecánico del Step 21 sin tocar auth.
 
 **Hacer**:
 
 - En `apps/api`: CORS habilitado para `localhost` y `*.localhost` en dev.
 - En `apps/web`:
   - `lib/env.ts`, `lib/api-client.ts` con `createTenant` + `getTenantBySlug`, `lib/subdomain.ts` con `extractTenantSlug`.
-  - `middleware.ts` que detecta subdominio y reescribe a `/t/:slug`. Reservados (`www`, `app`) → no se tratan como tenant.
-  - Landing en `/`: hero + form de signup (name + slug + primaryColor) que postea a `POST /tenants` y redirige a `http://<slug>.localhost:3000`.
+  - `middleware.ts` que detecta subdominio y reescribe a `/t/:slug`. Reservados (`www`, `superadmin`) → no se tratan como tenant.
+  - Landing en `/`: por ahora, hero + form de signup (usado solo durante Step 4.5 para probar `POST /tenants` en vivo). En Step 13 este form se elimina y la landing pasa a comercial con CTA WhatsApp.
   - Página del tenant en `app/t/[slug]/page.tsx`: server component que hace `GET /tenants/by-slug/:slug` y aplica `branding.primaryColor` como CSS var + muestra `logoUrl` si está.
   - `app/t/[slug]/not-found.tsx`: 404 cuando el slug no existe / `is_active=false`.
 - `.env.example` actualizado con `NEXT_PUBLIC_API_URL`.
-- shadcn/ui formal queda diferido al Step 20 — acá vamos con Tailwind directo para no enredarnos con la CLI de shadcn + Tailwind 4 a mitad de paso.
 
-**Criterio**: en el navegador, `localhost:3000` muestra la landing; signup crea el tenant y redirige; `<slug>.localhost:3000` muestra el nombre del gimnasio con el color primario aplicado; un slug inexistente muestra el 404. Sin tests automáticos nuevos (el backend ya está cubierto en Step 4); el smoke es manual en browser.
+**Criterio**: en el navegador, `localhost:3000` muestra la landing; signup (provisional) crea el tenant y redirige; `<slug>.localhost:3000` muestra el nombre del gimnasio con el color primario aplicado; un slug inexistente muestra el 404.
+
+> Nota: el form de signup de este step es **temporal** para validar el flujo end-to-end sin auth. El modelo definitivo es sales-led y el form se reemplaza por una landing comercial en Step 13 / Step 28. Ver ADR-012.
 
 ---
 
 ### Step 5 — Entity User + módulo Users
 
-**Objetivo**: tabla `users` y CRUD interno.
+**Objetivo**: tabla `users` con superadmin y student-friendly desde el arranque.
 
 **Hacer**:
 
-- Entity `User` con todos los campos de `docs/02-dominio.md`.
-- Migración.
-- `UsersModule` con service. **Sin endpoints públicos** todavía; lo va a usar `auth`.
-- Helpers: `findByEmailAndTenant`, `create`, `setActive`.
+- Entity `User` con todos los campos de `docs/02-dominio.md`, incluidos `is_superadmin`, `must_change_password`, `dni`, `password_hash` y `tenant_id` nullables a nivel tabla.
+- Migración con:
+  - UNIQUE `(tenant_id, email)` y UNIQUE `(tenant_id, dni)`.
+  - Índice parcial único `CREATE UNIQUE INDEX users_email_global_unique ON users(email) WHERE tenant_id IS NULL` para SUPERADMINs.
+- `UsersModule` con service. **Sin endpoints públicos** todavía; lo van a usar `auth` y `superadmin`.
+- Helpers: `findByEmailAndTenant`, `findSuperadminByEmail`, `findStudentByDniAndTenant`, `create`, `setActive`, `setMustChangePassword`.
+- Validación en service: si `role=STUDENT` → `dni` requerido y `password_hash` debe ser NULL; si `is_superadmin=true` → `tenant_id=NULL`, `role=NULL`, `password_hash` requerido.
 
-**Criterio**: unit tests del service. Constraint UNIQUE de `(tenant_id, email)` verificado en test.
+**Criterio**: unit tests del service cubriendo cada constraint (UNIQUE compuesto, índice parcial, validaciones por rol).
 
 ---
 
 ### Step 6 — Argon2 + helpers de password
 
-**Objetivo**: hashear y verificar passwords.
+**Objetivo**: hashear y verificar passwords + generar passwords de sistema.
 
 **Hacer**:
 
-- `apps/api/src/modules/auth/password.service.ts` con `hash` y `verify`.
+- `apps/api/src/modules/auth/password.service.ts` con `hash`, `verify`, y `generate()` (16 chars, alfabeto `[a-zA-Z0-9]` sin `0/O/o/1/l/I`, CSPRNG).
 - Params Argon2id según `docs/04-auth.md`.
-- Unit tests: roundtrip, rechazo de password incorrecta.
+- Unit tests: roundtrip, rechazo de password incorrecta, `generate()` produce strings del largo y alfabeto esperados.
 
 **Criterio**: tests verdes.
 
 ---
 
-### Step 7 — Auth: signup OWNER + tenant
+### Step 7 — Superadmin: schema + seed CLI + login básico
 
-**Objetivo**: endpoint público que crea tenant + OWNER en una transacción.
+**Objetivo**: dejar el SUPERADMIN funcional end-to-end antes del login normal de tenant.
 
 **Hacer**:
 
-- `POST /auth/signup` con DTO (slug, tenantName, email, password, firstName, lastName).
-- Validación: slug disponible, email no duplicado dentro de un tenant nuevo (irrelevant), password fuerte.
-- Crear `tenant` (status `trial`) + `user` (OWNER) en una transacción.
-- Devolver `{ tenant: {...}, user: {...}, accessToken: null }` (login viene en step 8, no auto-login).
+- Migración ya aplicada en Step 5 (este step solo construye encima de ella).
+- Script CLI `pnpm --filter api seed:superadmin`: lee email + password por stdin, los valida, hashea con Argon2id, crea `user` con `is_superadmin=true`, `tenant_id=NULL`, `role=NULL`, `must_change_password=false`. Si ya existe un SUPERADMIN con ese email, falla con mensaje claro.
+- `AuthModule` mínimo con `POST /auth/login` que **solo soporta el caso SUPERADMIN por ahora**: detecta host `superadmin.rutinex.app` (en dev, `superadmin.localhost`) o un header de override en tests; busca `user` por email con `is_superadmin=true`, valida password, emite access JWT con `{ sub, tenantId: null, role: null, isSuperadmin: true, iat, exp }`. Sin refresh todavía.
+- `SuperadminGuard` que verifica `req.user.isSuperadmin === true` (todavía sin endpoints que lo usen — se prueba con un endpoint dummy en el test).
+- `apps/api/scripts/README.md` documentando el script.
 
-**Criterio**: E2E que signup crea ambos, slug duplicado rechaza, password débil rechaza.
+**Criterio**: E2E: seed crea el SUPERADMIN; login desde host `superadmin.*` devuelve JWT válido; login desde otro host con esas credenciales → `401 invalid credentials`; endpoint dummy con `SuperadminGuard` responde 200 con el JWT y 403 sin él.
 
 ---
 
-### Step 8 — Auth: login + JWT access token
+### Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive
 
-**Objetivo**: login emite access token. Sin refresh todavía.
+**Objetivo**: completar el login para todos los roles asumiendo SUPERADMIN ya existente. Sin refresh todavía (eso es Step 9).
 
 **Hacer**:
 
-- `POST /auth/login`. Resolución de tenant según `docs/04-auth.md` flujo Login.
+- `POST /auth/login` ahora también soporta hosts `<slug>.rutinex.app` (en dev, `<slug>.localhost`): resuelve `tenant_id` desde el slug; busca `user` por `(tenant_id, email)` con `is_superadmin=false`; emite JWT con `{ sub, tenantId, role, isSuperadmin: false, ... }`.
+- `POST /auth/student-login` con `{ dni }`: solo válido en subdominios de tenant; busca `(tenant_id, dni, role='STUDENT')`; emite JWT con `role: 'STUDENT'`.
+- Ambos endpoints rechazan `403 TENANT_INACTIVE` si `tenant.is_active=false`, y `403 USER_INACTIVE` si `user.is_active=false`.
+- Ambos devuelven `user.mustChangePassword: boolean` en la response.
+- `POST /auth/change-password`:
+  - Forzado (`must_change_password=true`): input `{ newPassword }`; el JWT autentica; setea `must_change_password=false` y deja a los refresh tokens listos para revocación cuando exista esa tabla (Step 9).
+  - Voluntario: input `{ currentPassword, newPassword }`; verifica `currentPassword` antes.
 - Passport `LocalStrategy` + `JwtStrategy`.
 - `JwtAuthGuard` global con decorador `@Public()`.
-- `JWT_ACCESS_SECRET` en env.
-- Token TTL 15min.
+- `JWT_ACCESS_SECRET` en env. TTL 15min.
 
-**Criterio**: E2E login devuelve token, token rechazado tras 15min (test con clock fake), token inválido → 401, password incorrecta → 401 genérico.
+**Criterio**: E2E:
+
+- Login OWNER por host de tenant → JWT con `role=OWNER`, `tenantId` resuelto.
+- Login STUDENT por DNI → JWT con `role=STUDENT`.
+- Cross-host (SUPERADMIN desde host de tenant; OWNER desde host SUPERADMIN) → 401 genérico.
+- Tenant inactivo → 403 con code `TENANT_INACTIVE`.
+- User inactivo → 403 con code `USER_INACTIVE`.
+- Login con password generada → response `mustChangePassword=true`; `POST /auth/change-password { newPassword }` con ese JWT funciona; login subsiguiente con la nueva password → `mustChangePassword=false`.
+- Modo voluntario: requiere `currentPassword`; sin ella → 400.
 
 ---
 
@@ -158,28 +176,30 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 **Hacer**:
 
-- Entity `RefreshToken` y migración.
+- Entity `RefreshToken` y migración. `tenant_id` nullable (NULL para tokens de SUPERADMIN).
 - `POST /auth/refresh` con rotación.
 - `POST /auth/logout` y `POST /auth/logout-all`.
 - Detección de reuso: si llega un refresh ya revocado, revocar todos los del user.
+- `change-password` (forzado y voluntario) revoca todos los refresh tokens del user.
 - Cookie httpOnly secure SameSite=Lax con scope `.rutinex.app` para el refresh.
 
-**Criterio**: E2E completo del flujo refresh, logout, logout-all, reuso.
+**Criterio**: E2E completo del flujo refresh, logout, logout-all, reuso. Cambio de password fuerza re-login en otros devices.
 
 ---
 
 ### Step 10 — Multi-tenancy guards + TenantScopedRepository
 
-**Objetivo**: ninguna query toca DB sin `tenant_id` filtrado.
+**Objetivo**: ninguna query toca DB sin `tenant_id` filtrado (excepto SUPERADMIN explícito).
 
 **Hacer**:
 
-- `TenantGuard` global que valida `x-tenant-slug` vs JWT.
+- `TenantGuard` global que valida `x-tenant-slug` vs JWT. Skipea rutas `/superadmin/*`.
+- `SuperadminGuard` aplicado a controllers `/superadmin/*`.
 - Decorador `@TenantId()`.
 - Clase base `TenantScopedRepository<T>` que rechaza queries sin tenant_id (al menos los métodos comunes: find, findOne, count, update, delete).
 - Refactor de services existentes para usarla.
 
-**Criterio**: E2E cross-tenant: user de tenant A no puede leer/modificar nada del B (devuelve 404, no 403, para no filtrar existencia). Test unit del TenantScopedRepository.
+**Criterio**: E2E cross-tenant: user de tenant A no puede leer/modificar nada del B (devuelve 404, no 403, para no filtrar existencia). Test unit del TenantScopedRepository. SUPERADMIN puede listar tenants sin `x-tenant-slug`.
 
 ---
 
@@ -190,7 +210,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 **Hacer**:
 
 - Decorador `@Roles('OWNER', 'TRAINER', 'STUDENT')`.
-- `RolesGuard` global.
+- `RolesGuard` global. No aplica a rutas marcadas con `SuperadminGuard`.
 - Endpoint dummy protegido por rol para test.
 
 **Criterio**: E2E: STUDENT no puede hacer un POST que requiere TRAINER, etc.
@@ -203,18 +223,42 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 **Hacer**:
 
-- `POST /users` (OWNER → puede crear TRAINER y STUDENT; TRAINER → solo STUDENT bajo su `trainer_id`).
+- `POST /users` (OWNER → puede crear TRAINER; TRAINER → puede crear STUDENT bajo su `trainer_id`):
+  - TRAINER: password generada por el sistema, devuelta **una vez**, `must_change_password=true`.
+  - STUDENT: sin password, `dni` obligatorio (validado en service), `must_change_password=false`.
+- `POST /users/:id/reset-password` (OWNER → reset de TRAINER; no aplica a STUDENT): genera nueva password, devuelve una vez, setea `must_change_password=true`, revoca refresh tokens.
 - `GET /users` con filtros (`role`, `isActive`, paginación).
 - `PATCH /users/:id` (cambiar nombre, `isActive`).
 - `DELETE /users/:id` (soft delete).
-- Validación de DNI (obligatorio para STUDENT).
-- Password generada en creación, devuelta una vez.
 
-**Criterio**: E2E completo. Trainer no puede listar users de otro trainer del mismo tenant (filtrado).
+**Criterio**: E2E completo. Trainer no puede listar users de otro trainer del mismo tenant (filtrado). Reset de password de TRAINER por OWNER funciona; reset por TRAINER → 403.
 
 ---
 
-### Step 13 — CRUD: Exercises
+### Step 13 — Panel de superadmin (backend): CRUD tenants + OWNER inicial
+
+**Objetivo**: dejar el SUPERADMIN operativo end-to-end vía API antes de hacer el frontend.
+
+**Hacer**:
+
+- Mover `POST /tenants` a `POST /superadmin/tenants` (público en Step 4 ya no aplica; ahora pasa por `SuperadminGuard`).
+- `POST /superadmin/tenants` crea tenant + OWNER inicial **en una sola transacción**: tenant (`is_active=true`), user OWNER con password generada (`must_change_password=true`). Response devuelve `{ tenant, owner: { id, email, ... }, ownerPassword: "..." }` con la password **una vez**.
+- `GET /superadmin/tenants` con filtro `?active=true|false|all`.
+- `PATCH /superadmin/tenants/:id` para toggle `is_active` y editar branding.
+- `POST /superadmin/tenants/:id/reset-owner-password`: genera nueva password del OWNER (el primero del tenant; si hay varios, ver al implementar), devuelve **una vez**, `must_change_password=true`, revoca refresh tokens.
+- `GET /tenants/by-slug/:slug` (público) sigue tal cual para la página del tenant.
+
+**Criterio**: E2E:
+
+- Sin JWT de SUPERADMIN → 401.
+- Con JWT de OWNER de un tenant → 403.
+- Con JWT de SUPERADMIN: crear tenant + OWNER funciona, devuelve password una vez; OWNER puede loguearse desde `<slug>.rutinex.app` con esa password y entra al flujo `mustChangePassword`.
+- Toggle `is_active=false` → todos los logins del tenant rechazan 403 `TENANT_INACTIVE`.
+- Reset password OWNER → la vieja deja de funcionar, la nueva sí, el OWNER queda con `mustChangePassword=true`.
+
+---
+
+### Step 14 — CRUD: Exercises
 
 **Objetivo**: ejercicios del tenant.
 
@@ -229,7 +273,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 14 — Storage de media (R2)
+### Step 15 — Storage de media (R2)
 
 **Objetivo**: subir gifs/videos de ejercicios a Cloudflare R2.
 
@@ -245,7 +289,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 15 — CRUD: Routines + RoutineItems
+### Step 16 — CRUD: Routines + RoutineItems
 
 **Objetivo**: armar rutinas con ejercicios ordenados.
 
@@ -260,7 +304,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 16 — Asignación de rutina a alumno
+### Step 17 — Asignación de rutina a alumno
 
 **Objetivo**: vincular rutina con alumno.
 
@@ -275,7 +319,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 17 — Sesión + tracking de sets
+### Step 18 — Sesión + tracking de sets
 
 **Objetivo**: el alumno ejecuta una rutina.
 
@@ -292,7 +336,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 18 — Personal Records
+### Step 19 — Personal Records
 
 **Objetivo**: derivar y consultar PRs.
 
@@ -306,7 +350,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 19 — Comments
+### Step 20 — Comments
 
 **Objetivo**: comentarios del alumno en ejercicios/sesiones.
 
@@ -322,67 +366,78 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ## Fase 2 — Frontend foundations
 
-### Step 20 — Setup base del frontend
+### Step 21 — Setup base del frontend (landing comercial + middleware completo)
 
-**Objetivo**: middleware de subdominios, layouts de las 3 superficies, shadcn instalado.
+**Objetivo**: middleware con los 3 surfaces (landing, tenant, superadmin), shadcn instalado, landing sales-led.
 
 **Hacer**:
 
-- `middleware.ts` con detección de host (ver `docs/03-multi-tenancy.md`).
-- Route groups `(marketing)`, `(admin)`, `(student)` con layouts placeholder.
+- `middleware.ts` con detección de host (ver `docs/03-multi-tenancy.md`):
+  - `superadmin.rutinex.app` → rewrite a `/superadmin/...`.
+  - `<slug>.rutinex.app` → rewrite a `/t/:slug/...` (ya estaba en Step 4.5).
+  - root → sin rewrite (landing).
+- Eliminar el form de signup del Step 4.5; landing comercial con hero + beneficios + botón "Contactanos por WhatsApp" (`wa.me/${env.contactWhatsapp}`).
+- `/pricing` informativa con tabla de planes y CTA al mismo WhatsApp.
+- Route groups `(admin)`, `(student)`, `(superadmin)` con layouts placeholder (los layouts reales con guards en Step 22).
 - shadcn/ui inicializado.
-- `lib/api-client.ts` con baseUrl desde env.
-- Página landing mínima en `/`.
+- `lib/env.ts` agrega `contactWhatsapp` (`NEXT_PUBLIC_CONTACT_WHATSAPP`).
+- `lib/subdomain.ts` agrega `isSuperadminHost(host)`.
 
-**Criterio**: localhost funciona. `localhost:3000` muestra landing, `app.localhost:3000` admin placeholder, `cualquier.localhost:3000` student placeholder.
+**Criterio**: localhost funciona. `localhost:3000` muestra landing con CTA WhatsApp; `superadmin.localhost:3000` muestra placeholder del surface superadmin; `<slug>.localhost:3000` muestra el tenant.
 
 ---
 
-### Step 21 — Auth en frontend (todas las superficies)
+### Step 22 — Auth en frontend (todas las superficies)
 
-**Objetivo**: login y refresh silencioso.
+**Objetivo**: login en cada surface, refresh silencioso, guard de `mustChangePassword` a nivel layout.
 
 **Hacer**:
 
 - Store de auth con Zustand (access token en memoria).
 - `useAuth()` hook.
-- Páginas: `/(marketing)/signup`, `/(admin)/login`, `/(student)/login`.
+- Páginas:
+  - `<slug>.rutinex.app/login`: tab "Staff" (email + password → `POST /auth/login`) + tab "Soy alumno" (DNI → `POST /auth/student-login`).
+  - `<slug>.rutinex.app/change-password` (forzado y voluntario).
+  - `superadmin.rutinex.app/login` (email + password → `POST /auth/login`).
+  - `superadmin.rutinex.app/change-password` (por consistencia, aunque hoy no se dispara).
+- **Layouts `(admin)` y `(superadmin)`**: si `user.mustChangePassword === true`, no renderizan children — renderizan solo el form de `/change-password` (modo forzado).
 - Refresh silencioso al cargar la app.
 - Redirect a login si protected route sin auth.
+- Mapeo de error codes (`TENANT_INACTIVE`, `USER_INACTIVE`) a mensajes específicos.
 
-**Criterio**: signup + login funcional contra el API. Refresh tras 15min funciona.
+**Criterio**: login funcional contra el API en los tres surfaces. Refresh tras 15min funciona. Login con password generada lleva al user al form forzado de `/change-password`; el resto del surface no es accesible hasta resolverlo.
 
 ---
 
-### Step 22 — Panel admin: alumnos
+### Step 23 — Panel admin: alumnos
 
 **Objetivo**: OWNER/TRAINER ven y gestionan alumnos.
 
 **Hacer**:
 
 - `/(admin)/students` con lista paginada.
-- `/(admin)/students/new` con form.
+- `/(admin)/students/new` con form (DNI requerido, sin password).
 - `/(admin)/students/:id` con detalle y toggle activo/inactivo.
 
 **Criterio**: flujo completo en mobile y desktop.
 
 ---
 
-### Step 23 — Panel admin: ejercicios y rutinas
+### Step 24 — Panel admin: ejercicios y rutinas
 
 **Objetivo**: CRUD desde frontend.
 
 **Hacer**:
 
 - `/(admin)/exercises` lista, crear, editar.
-- Subida de media con presigned URL (step 14).
+- Subida de media con presigned URL (Step 15).
 - `/(admin)/routines` lista, builder con drag&drop de items.
 
 **Criterio**: TRAINER puede armar una rutina con 5 ejercicios y subir un gif.
 
 ---
 
-### Step 24 — Panel admin: asignaciones
+### Step 25 — Panel admin: asignaciones
 
 **Objetivo**: asignar rutina a alumno desde UI.
 
@@ -395,7 +450,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 25 — App del student: home, sesión, tracking
+### Step 26 — App del student: home, sesión, tracking
 
 **Objetivo**: alumno entra, ve la rutina del día, la ejecuta.
 
@@ -411,7 +466,7 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
-### Step 26 — App del student: histórico y PRs
+### Step 27 — App del student: histórico y PRs
 
 **Objetivo**: el alumno ve su progreso.
 
@@ -424,27 +479,43 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 
 ---
 
+### Step 28 — Frontend del SUPERADMIN
+
+**Objetivo**: surface `(superadmin)` completo para operar sales-led desde el navegador.
+
+**Hacer**:
+
+- `/(superadmin)/tenants`: tabla con filtro activo/inactivo, búsqueda por slug/name.
+- `/(superadmin)/tenants/new`: form (slug, name, branding opcional, email + nombre + apellido del OWNER). Al crear, muestra modal con la password del OWNER en plano + botón "Copiar". Mensaje claro de "se muestra una sola vez".
+- `/(superadmin)/tenants/:id`: detalle con toggle `is_active`, edit branding, botón "Resetear password OWNER" (mismo modal de password).
+- Mensajes y UX consistentes para el flujo de "copiar la password y pasársela por WhatsApp".
+
+**Criterio**: el SUPERADMIN puede crear un tenant + OWNER, copiar la password, pasarla, el OWNER se loguea, pasa por `change-password`, queda operativo. Toggle inactivo bloquea el login del tenant.
+
+---
+
 ## Fase 3 — Producción
 
-### Step 27 — Deploy
+### Step 29 — Deploy
 
 **Objetivo**: producción mínima.
 
 **Hacer**:
 
-- DNS con wildcard.
+- DNS con wildcard (incluido `superadmin.rutinex.app`).
 - API en Railway o Fly.
 - Web en Vercel.
 - Postgres en Neon.
-- R2 ya configurado en step 14.
-- Variables de entorno seteadas en cada plataforma.
+- R2 ya configurado en Step 15.
+- Variables de entorno seteadas en cada plataforma (incluido `NEXT_PUBLIC_CONTACT_WHATSAPP`).
 - Smoke test post-deploy.
+- Seed del primer SUPERADMIN en prod vía `pnpm --filter api seed:superadmin`.
 
-**Criterio**: signup desde `rutinex.app`, login, crear alumno, ejecutar sesión, todo en prod.
+**Criterio**: SUPERADMIN crea un tenant desde `superadmin.rutinex.app`, el OWNER entra, crea un alumno, el alumno ejecuta una sesión, todo en prod.
 
 ---
 
-### Step 28 — Observabilidad mínima
+### Step 30 — Observabilidad mínima
 
 **Objetivo**: saber cuándo algo se rompe.
 
@@ -463,6 +534,9 @@ Pasos numerados, ordenados, con criterios de aceptación claros. Se trabaja **un
 Sin numerar todavía. Cuando alguna de estas se priorice, se vuelve un step numerado.
 
 - Billing real (MercadoPago para AR).
+- Audit log de acciones del SUPERADMIN (crear tenant, reset password, toggle `is_active`, edit branding).
+- Rate limiting más agresivo en `superadmin.rutinex.app/login`.
+- Self-service signup si el modelo vuelve a PLG (reactivar `/auth/signup`, formulario en landing, validación de slug en signup, email de confirmación).
 - Invitación de alumno por email/WhatsApp con link mágico.
 - Comentarios visibles al trainer + notifs.
 - PWA (manifest + service worker, install prompt).
@@ -470,5 +544,5 @@ Sin numerar todavía. Cuando alguna de estas se priorice, se vuelve un step nume
 - Mediciones corporales (peso, perímetros).
 - Plan nutricional.
 - Reportes para el trainer (alumnos activos, sesiones por semana).
-- 2FA para trainers.
+- 2FA para trainers y SUPERADMIN.
 - Dashboard del OWNER con métricas del negocio.
