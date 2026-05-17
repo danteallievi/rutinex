@@ -86,12 +86,12 @@ Aplica cuando se crea un OWNER (por SUPERADMIN), un TRAINER (por OWNER), o se re
 
 ### Login (OWNER, TRAINER, SUPERADMIN)
 
-1. Cliente: `POST /auth/login { email, password }`. El slug viene del header `x-tenant-slug` (subdominio del tenant) o el host es `superadmin.rutinex.app`.
+1. Cliente: `POST /auth/login { email, password }`. La superficie se resuelve por el header `Host` (en tests se acepta override con `x-rutinex-host`): host `superadmin.<algo>` → flujo SUPERADMIN; host `<slug>.<algo>` → flujo de tenant (el slug se infiere del subdominio).
 2. Resolución de tenant según el host:
    - **Host `superadmin.rutinex.app`** → buscar `user` por `email` con `is_superadmin=true` y `tenant_id IS NULL` (matchea el índice parcial único `users_email_global_unique`).
    - **Host `<slug>.rutinex.app`** → resolver `tenant_id` desde el slug; buscar `user` por `(tenant_id, email)` con `is_superadmin=false`.
    - Si el host no matchea ninguno de los dos patrones → `401 invalid credentials` genérico.
-3. Si no existe el `user` → `401 invalid credentials` (mensaje genérico, sin filtrar existencia).
+3. Si no existe el `user` → `401 invalid credentials` con `code: INVALID_CREDENTIALS` (mensaje genérico, sin filtrar existencia).
 4. Si el host es de tenant y `tenant.is_active = false` → `403 tenant inactive` con código `TENANT_INACTIVE` y mensaje "Tu cuenta está pausada. Contactá a tu vendedor por WhatsApp."
 5. Si `user.is_active = false` → `403 user inactive` con código `USER_INACTIVE` y mensaje "Tu cuenta está pausada, contactá a tu entrenador."
 6. Verificar password con Argon2. Si no matchea → `401 invalid credentials` genérico.
@@ -190,15 +190,15 @@ El SUPERADMIN usa exactamente el mismo flujo de auth: mismo endpoint `POST /auth
 
 Vienen del módulo `auth`. Resumen:
 
-| Decorador / Guard       | Para qué                                                                             |
-| ----------------------- | ------------------------------------------------------------------------------------ |
-| `@Public()`             | Marca endpoints sin auth. (El JWT guard global skipea estos.)                        |
-| `JwtAuthGuard` (global) | Valida access token y popula `req.user` (incluye `isSuperadmin`).                    |
-| `RolesGuard`            | Junto con `@Roles('OWNER')` o `@Roles('TRAINER', 'OWNER')`. No aplica a SUPERADMIN.  |
-| `SuperadminGuard`       | Requiere `req.user.isSuperadmin === true`. Usado en controllers `/superadmin/*`.     |
-| `TenantGuard` (global)  | Valida que el `x-tenant-slug` (si vino) coincida con el JWT. Skipea `/superadmin/*`. |
-| `@CurrentUser()`        | Inyecta el user actual en el handler.                                                |
-| `@TenantId()`           | Inyecta el `tenantId` actual.                                                        |
+| Decorador / Guard       | Para qué                                                                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `@Public()`             | Marca endpoints sin auth. (El JWT guard global skipea estos.)                                                             |
+| `JwtAuthGuard` (global) | Valida access token y popula `req.user` (incluye `isSuperadmin`).                                                         |
+| `RolesGuard`            | Junto con `@Roles('OWNER')` o `@Roles('TRAINER', 'OWNER')`. No aplica a SUPERADMIN.                                       |
+| `SuperadminGuard`       | Requiere `req.user.isSuperadmin === true`. 403 con `code: NOT_SUPERADMIN` si falla. Usado en controllers `/superadmin/*`. |
+| `TenantGuard` (global)  | Valida que el `x-tenant-slug` (si vino) coincida con el JWT. Skipea `/superadmin/*`.                                      |
+| `@CurrentUser()`        | Inyecta el user actual en el handler.                                                                                     |
+| `@TenantId()`           | Inyecta el `tenantId` actual.                                                                                             |
 
 Orden de guards: `JwtAuthGuard` → (`SuperadminGuard` para `/superadmin/*` | `TenantGuard` para el resto) → `RolesGuard`.
 

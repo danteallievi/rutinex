@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 6 completo. Próximo: Step 7 — Superadmin: schema + seed CLI + login básico.
-**Última actualización**: 2026-05-17 — Step 6 (Argon2id + helpers de password).
+**Paso actual**: Step 7 completo. Próximo: Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive.
+**Última actualización**: 2026-05-17 — Step 7 (superadmin seed CLI + login + SuperadminGuard).
 
 ## Cambios de doc
 
@@ -209,9 +209,43 @@ Notas:
 - Se eligió `crypto.randomBytes` + rejection sampling sobre `crypto.randomInt` para apegarse al criterio explícito del Step 6 ("CSPRNG via `crypto.randomBytes`") y dejar visible el cálculo de `maxValid` que evita el sesgo modular.
 - `docs/04-auth.md` ya documenta la política completa (params Argon2id y alfabeto sin ambiguos); este step solo la implementa, no la cambia.
 
+### Step 7 — Superadmin: schema + seed CLI + login básico (2026-05-17)
+
+Bootstrap del SUPERADMIN + login mínimo del surface `/superadmin/*` con guard end-to-end. Sin refresh tokens todavía (eso es Step 9). Dependencias nuevas en `apps/api`: `@nestjs/jwt`, `@nestjs/passport`, `passport`, `passport-jwt`, `@types/passport-jwt`.
+
+**Seed CLI** — `pnpm --filter @rutinex/api seed:superadmin` (`apps/api/src/scripts/seed-superadmin.ts`):
+
+- Lee email + password desde stdin. En TTY oculta el password con `setRawMode`; en modo piped lee todo stdin como dos líneas (workaround del bug de `readline.question` cuando stdin EOFa entre prompts en modo no-TTY).
+- Valida email (regex razonable, no RFC) y largo mínimo 12 chars (`MIN_HUMAN_PASSWORD_LENGTH` en `seed-superadmin.ts`).
+- Hashea con `PasswordService.hash` y delega a `UsersService.create({ isSuperadmin: true, tenantId: null, role: null, mustChangePassword: false, ... })`. Defaults `firstName='Super'`/`lastName='Admin'` (el roadmap solo exige email + password).
+- Si colisiona con el índice parcial único `users_email_global_unique`, `UsersService` tira `ConflictException({ code: 'SUPERADMIN_EMAIL_TAKEN' })`; el script lo detecta con `isSuperadminEmailTakenError` y sale con `exit=2` + mensaje claro. Errores de validación → `exit=1`. Documentación en `apps/api/scripts/README.md`.
+
+**`POST /auth/login`** (Step 7 = solo SUPERADMIN):
+
+- `apps/api/src/modules/auth/auth.controller.ts` recibe `LoginDto { email, password }` y resuelve la superficie con `extractHostname(req.headers)` + `isSuperadminHost(...)` (`apps/api/src/modules/auth/host.ts`). El extractor prefiere el header `x-rutinex-host` cuando existe (override para tests sin tener que jugar con `.set('Host', ...)` en todos lados, aunque ambos funcionan).
+- `AuthService.login(host, dto)` corta short-circuit con `401 INVALID_CREDENTIALS` si el host no es SUPERADMIN — no se filtra existencia entre superficies (alguien usando creds de SUPERADMIN desde `<slug>.rutinex.app` ve exactamente la misma 401 que si las credenciales fueran inválidas).
+- En el flujo SUPERADMIN: busca con `findSuperadminByEmail`; si no existe o password no matchea → 401 `INVALID_CREDENTIALS`; si `is_active=false` → 403 `USER_INACTIVE`; si todo OK, firma JWT con payload `{ sub, tenantId: null, role: null, isSuperadmin: true }` y devuelve `{ accessToken, user: { id, role: null, isSuperadmin: true, mustChangePassword, firstName, lastName, tenant: null } }`. **Sin `refreshToken` todavía** (Step 9).
+
+**JWT** — `JwtModule.registerAsync` con secret `JWT_ACCESS_SECRET` (env), HS256, `expiresIn: '15m'`. `JwtStrategy` (passport-jwt, Authorization: Bearer) mapea el payload a `AuthenticatedUser { userId, tenantId, role, isSuperadmin }` en `req.user`. `JwtAuthGuard` es el `AuthGuard('jwt')` standard. `SuperadminGuard` (custom) tira `403 NOT_SUPERADMIN` si `req.user.isSuperadmin !== true`. Se aplican en orden `JwtAuthGuard → SuperadminGuard` a nivel controller (Step 10 va a montar el JwtAuthGuard como global).
+
+**Endpoint dummy del surface superadmin** — `GET /superadmin/ping` (`apps/api/src/modules/superadmin/superadmin.controller.ts`). Solo existe para probar el guard end-to-end: 200 con JWT de SUPERADMIN, 401 sin JWT / token inválido, 403 con JWT no-superadmin (`NOT_SUPERADMIN`). Step 13 lo reemplaza con CRUD real de tenants.
+
+**Drift fix colateral**: `apps/api/src/modules/tenants/slug.ts` no incluía `superadmin` en `RESERVED_SLUGS` aunque `docs/03-multi-tenancy.md` lo listaba. Agregado.
+
+Archivos clave: `apps/api/src/modules/auth/{auth.controller,auth.service,auth.module,host,jwt-payload,jwt.strategy,jwt-auth.guard,superadmin.guard,seed-superadmin}.ts` + sus `*.spec.ts`, `apps/api/src/modules/auth/dto/login.dto.ts`, `apps/api/src/modules/superadmin/{superadmin.controller,superadmin.module}.ts`, `apps/api/src/scripts/seed-superadmin.ts`, `apps/api/scripts/README.md`, `apps/api/package.json` (+`seed:superadmin` script), `apps/api/.env.example` + `.env.example` raíz (`JWT_ACCESS_SECRET`), `apps/api/test/auth.e2e-spec.ts`, `apps/api/test/jest-e2e.json` (`maxWorkers: 1` para serializar E2E que comparten DB), `docs/04-auth.md`, `docs/05-api-conventions.md` (tabla de codes), `apps/api/src/app.module.ts`.
+
+Verificación: `pnpm lint` clean. `pnpm --filter @rutinex/api test` 71/71 (45 previos + 26 nuevos en host/auth-service/seed/superadmin-guard). `pnpm --filter @rutinex/api test:e2e` 23/23 (12 tenants previos + 11 nuevos en `auth.e2e-spec.ts`). Smoke del CLI: primer run crea, segundo run con mismo email sale exit 2 con `Ya existe un SUPERADMIN con ese email.`
+
+Notas:
+
+- E2E ahora corre con `maxWorkers: 1`. Antes con un solo spec no había problema; sumar `auth.e2e-spec.ts` que también escribe en `users`/`tenants` exponía una carrera con `tenants.e2e-spec.ts`. Serializar es la opción simple; alternativa futura (cuando duela), schemas por worker.
+- `extractHostname` lee `x-rutinex-host` antes que `Host`. El header de override permite tests sin tener que forzar `Host` (aunque `Host` también se respeta — los E2E lo prueban con ambos).
+- El `INVALID_CREDENTIALS` 401 cubre tres casos (host inválido, user inexistente, password incorrecta). Ningún caller necesita distinguirlos — el frontend muestra el mismo mensaje "Email o contraseña inválidos."
+- La password mínima en el CLI es 12 chars. En `change-password` (Step 8) habrá una política de fortaleza pública; por ahora 12 es un default razonable para no exponer al bootstrap a passwords débiles.
+
 ## Próxima acción concreta
 
-Step 7 — Superadmin: schema + seed CLI + login básico. Migración ya está aplicada (Step 5). Falta script `pnpm --filter api seed:superadmin` que hashea con `PasswordService.hash`, crea el SUPERADMIN, y un `POST /auth/login` mínimo que soporte el host `superadmin.*` con emisión de JWT (sin refresh todavía) + `SuperadminGuard`. Criterios en `docs/07-roadmap.md` Step 7.
+Step 8 — Auth: login de tenant + student-login + change-password + tenant inactive. Reusa toda la infra del Step 7. Criterios en `docs/07-roadmap.md` Step 8.
 
 ## Pendientes / deudas técnicas
 

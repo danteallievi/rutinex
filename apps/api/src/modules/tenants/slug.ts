@@ -24,6 +24,7 @@ export const RESERVED_SLUGS: ReadonlySet<string> = new Set([
   'rutinex',
   'static',
   'status',
+  'superadmin',
   'support',
   'www',
 ]);
