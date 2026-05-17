@@ -8,6 +8,7 @@ import { AppService } from './app.service';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { getDataSourceOptions } from './config/database';
 import { TenantsModule } from './modules/tenants/tenants.module';
+import { UsersModule } from './modules/users/users.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { TenantsModule } from './modules/tenants/tenants.module';
       useFactory: () => getDataSourceOptions(),
     }),
     TenantsModule,
+    UsersModule,
   ],
   controllers: [AppController],
   providers: [

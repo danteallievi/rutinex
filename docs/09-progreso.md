@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations (con interludio visual encima).
-**Paso actual**: Step 4.5 completo. Próximo: Step 5 — Entity User + módulo Users (ahora con superadmin desde el arranque).
-**Última actualización**: 2026-05-17 — cambio de modelo a sales-led (ver "Cambios de doc" abajo). Sin cambios de código todavía.
+**Paso actual**: Step 5 completo. Próximo: Step 6 — Argon2 + helpers de password.
+**Última actualización**: 2026-05-17 — Step 5 (entity User + módulo Users con superadmin desde el arranque).
 
 ## Cambios de doc
 
@@ -152,9 +152,39 @@ Notas:
 - El path alias `@/*` (apuntando a `./*` desde `apps/web`) ya estaba configurado en `tsconfig.json` desde el `create-next-app` del Step 1.
 - `cache: 'no-store'` en `getTenantBySlug` para que el branding recién creado se vea al toque post-signup. En prod podemos pasar a `revalidate: 30` cuando convenga.
 
+### Step 5 — Entity User + módulo Users (2026-05-17)
+
+Tabla `users` levantada con el schema sales-led de una sola pasada (sin migraciones intermedias para el modelo viejo). Entity, módulo y service listos para que `auth` y `superadmin` los consuman en pasos siguientes.
+
+Entity `User` en `apps/api/src/modules/users/entities/user.entity.ts`: `id`, `tenant_id` (uuid nullable + FK `RESTRICT` a `tenants`), `email` (varchar 255 nullable), `password_hash` (varchar 255 nullable), `must_change_password` (bool default false), `is_superadmin` (bool default false), `first_name`/`last_name` (varchar 100), `dni` (varchar 20 nullable), `role` (enum nullable: `OWNER`/`TRAINER`/`STUDENT`), `trainer_id` (uuid nullable + FK self `SET NULL`), `is_active` (bool default true), `last_login_at` (timestamptz nullable), `created_at`/`updated_at`. Índices: `ix_users_tenant_id`, `uq_users_tenant_email` (compuesto único), `uq_users_tenant_dni` (compuesto único) y el parcial único `users_email_global_unique ON users(email) WHERE tenant_id IS NULL` (para SUPERADMINs).
+
+Migración `apps/api/src/migrations/1779120000000-InitUsers.ts` escrita a mano (mismo patrón que `InitTenants`): crea `public.user_role` (enum), crea `users` con los FKs nombrados explícito (`fk_users_tenant`, `fk_users_trainer`), crea los cuatro índices. `up`/`down` probados con `migration:run` + `migration:revert` + `migration:run` (drift check via `migration:generate` no encuentra cambios).
+
+`UsersModule` en `apps/api/src/modules/users/users.module.ts`: solo `TypeOrmModule.forFeature([User])` + `UsersService`. **Sin controller** todavía (Step 7 y Step 13 lo consumen vía service).
+
+`UsersService` en `apps/api/src/modules/users/users.service.ts`:
+
+- Helpers: `findByEmailAndTenant(tenantId, email)` (excluye `is_superadmin=true`), `findSuperadminByEmail(email)` (matchea índice parcial: `tenant_id IS NULL` + `is_superadmin=true`), `findStudentByDniAndTenant(tenantId, dni)` (filtra `role='STUDENT'`).
+- `create(input)` con validación por rol vía `BadRequestException` con `code` parseable (SUPERADMIN: `tenant_id`/`role` deben ser NULL, password requerido, sin DNI ni trainer; STUDENT: `tenant_id`+`dni` requeridos, password debe ser NULL — ADR-014; STAFF: `tenant_id`+`email`+`password_hash` requeridos, sin DNI). Pre-check de unicidad usando los mismos helpers, tira `ConflictException` con `code` (`SUPERADMIN_EMAIL_TAKEN`/`EMAIL_TAKEN`/`DNI_TAKEN`) antes de tocar la DB.
+- `setActive(id, isActive)` y `setMustChangePassword(id, value)`: update directo, 404 si no afecta filas.
+
+Tests (`users.service.spec.ts`, repo mockeado): cada helper (shape del where), cada constraint de validación por rol (SUPERADMIN, STAFF, STUDENT — un caso por invariante), cada `ConflictException` por UNIQUE compuesto + el caso "mismo email/DNI en otro tenant pasa OK" (asegura que el chequeo es por `(tenant_id, X)` y no global), y los dos setters incluyendo el 404.
+
+Cleanup colateral: en `tenant.entity.ts`, el default de `branding` pasó de `() => "'{}'::jsonb"` a `() => "'{}'"` para eliminar el drift simétrico que el detector de migraciones de TypeORM venía marcando (no afecta el comportamiento runtime — jsonb acepta el text constant sin cast explícito).
+
+Archivos clave: `apps/api/src/modules/users/{entities/user.entity,users.module,users.service,users.service.spec}.ts`, `apps/api/src/migrations/1779120000000-InitUsers.ts`, `apps/api/src/app.module.ts` (import del módulo), `apps/api/src/modules/tenants/entities/tenant.entity.ts` (default de branding).
+
+Verificación: `pnpm lint` clean en root; `pnpm test` (apps/api) 37/37 verde; `pnpm test:e2e` 12/12 verde sin regresiones del Step 4.
+
+Notas:
+
+- Los FK constraints van con nombre explícito (`foreignKeyConstraintName`) para que TypeORM no detecte drift contra los nombres generados.
+- El service rechaza estados imposibles con `BadRequestException` + `code` (`SUPERADMIN_MUST_HAVE_NO_TENANT`, `STUDENT_NO_PASSWORD`, etc.) antes de invocar la DB. Si más adelante el `code` se necesita en el frontend, queda agregarlo a la tabla de `docs/05-api-conventions.md` cuando un endpoint lo exponga (en Step 5 ningún endpoint expone estos errores todavía, así que no se documenta como contrato público aún).
+- `subscription_status` sigue diferido (no aparece en la entity ni en la migración), alineado con `docs/02-dominio.md`.
+
 ## Próxima acción concreta
 
-Step 5 — Entity User + módulo Users (con el schema ya alineado a sales-led: `is_superadmin`, `must_change_password`, `dni`, `password_hash` y `tenant_id` nullables, índice parcial único para email de SUPERADMINs). Criterios y detalle en `docs/07-roadmap.md` (renumerado).
+Step 6 — Argon2 + helpers de password (`apps/api/src/modules/auth/password.service.ts` con `hash`, `verify`, `generate()` — 16 chars del alfabeto sin caracteres ambiguos, CSPRNG). Criterios en `docs/07-roadmap.md` Step 6.
 
 ## Pendientes / deudas técnicas
 

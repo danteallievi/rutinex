@@ -25,7 +25,7 @@ export class Tenant {
   @Column({ type: 'varchar', length: 255 })
   name!: string;
 
-  @Column({ type: 'jsonb', default: () => "'{}'::jsonb" })
+  @Column({ type: 'jsonb', default: () => "'{}'" })
   branding!: TenantBranding;
 
   @Column({ name: 'is_active', type: 'boolean', default: true })
