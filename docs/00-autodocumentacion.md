@@ -69,7 +69,7 @@ Las reglas de abajo cubren cada tipo de cambio frecuente. Para cada uno: **qué 
 1. Actualizar `docs/09-progreso.md`: marcar el paso como completo con la fecha y un resumen de 1-3 líneas de qué quedó hecho.
 2. Si quedan deudas técnicas o follow-ups del paso, listarlos en la sección "Pendientes" de `09-progreso.md`.
 3. Commit `step(N): <descripción>` que incluye tanto el código como la actualización de docs.
-4. Responder al usuario con el **formato de cierre de step** (definido en `CLAUDE.md` → "Flujo por paso"): tres secciones breves — resumen, visible en la web, prompt para la próxima sesión. Nada más.
+4. Responder al usuario con el **formato de cierre de step** (definido en `CLAUDE.md` → "Flujo por paso"): tres secciones breves — resumen, visible en la web, prompt para la próxima sesión. Nada más. Cuando el step que viene tiene superficies independientes, el prompt puede incluir un breakdown de sub-agentes paralelos (ver ADR-015).
 
 ## Procedimiento G — Pausa por límite de tokens / fin de sesión
 

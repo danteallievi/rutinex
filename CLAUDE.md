@@ -39,7 +39,7 @@ Resumen:
 
 ### 3. Flujo por paso
 
-El roadmap (`docs/07-roadmap.md`) está dividido en pasos numerados. Cada paso tiene criterios de aceptación claros. Trabajá **un paso a la vez**:
+El roadmap (`docs/07-roadmap.md`) está dividido en pasos numerados. Cada paso tiene criterios de aceptación claros. Trabajá **un paso a la vez** — esto significa **un commit por step**, no necesariamente un solo agente. Si el step tiene superficies independientes (típicamente backend + frontend, o módulos sin archivos compartidos), el thread principal puede lanzar sub-agentes en paralelo y orquestar el cierre. Reglas en ADR-015.
 
 1. Identificá el paso actual en `docs/09-progreso.md`.
 2. Leé los criterios de aceptación de ese paso en el roadmap.
@@ -56,7 +56,7 @@ Al terminar el commit del step, respondé breve y conciso, en tres secciones:
 
 1. **Resumen** — 1-3 líneas de qué quedó hecho (el detalle largo vive en `docs/09-progreso.md`, no lo repitas acá).
 2. **Visible en la web** — qué puede ver el usuario navegando la web (`pnpm web:dev`). Si el step es backend puro y no hay nada nuevo visible, decilo explícito ("nada nuevo — backend puro").
-3. **Prompt para la próxima sesión** — un bloque listo para copiar/pegar que arranque el siguiente step: orden de docs a leer, criterios de aceptación clave, y cualquier regla específica de ese step.
+3. **Prompt para la próxima sesión** — un bloque listo para copiar/pegar que arranque el siguiente step: orden de docs a leer, criterios de aceptación clave, y cualquier regla específica de ese step. Cuando el step que viene tiene superficies independientes, el prompt puede incluir un breakdown de sub-agentes paralelos (uno por surface), con el scope de cada uno + las reglas de orquestación del thread principal (validación, merge si hay colisiones, commit único al final). Ver ADR-015. Si el step es monolítico (un solo módulo acoplado), el prompt va serial y listo.
 
 Nada más. Sin "qué aprendí", sin re-explicar el plan, sin pedir confirmación. El usuario corta o sigue.
 

@@ -342,4 +342,37 @@ Lock de versiones mayores. Se sube major solo con justificación explícita en A
 
 ---
 
+## ADR-015 — Paralelización con sub-agentes dentro de un step
+
+**Contexto**: el flujo de `CLAUDE.md` dice "Trabajá un paso a la vez". Esa regla apunta a mantener prolijidad (un commit por step, un mensaje de cierre claro, docs sincronizadas). Pero leída al pie de la letra implica que el thread principal hace todo solo, lo cual frena cuando el step tiene superficies independientes — típicamente backend + frontend, o varios módulos sin archivos compartidos. El interludio visual del Step 4.5 y el visual sprint planeado (Step 7.5) son ejemplos donde múltiples agentes podrían avanzar en paralelo sin pisarse.
+
+**Opciones**:
+
+- **A. Serial estricto**: un solo agente por step, siempre. Garantiza orden pero deja productividad sobre la mesa cuando hay paralelismo natural.
+- **B. Paralelismo abierto**: cada sub-agente decide qué hacer y commitea por su cuenta. Maximiza velocidad pero rompe la prolijidad (varios commits por step, docs desincronizadas, conflictos sin árbitro).
+- **C. Paralelismo orquestado por el thread principal**: el thread principal escribe el plan, lanza N sub-agentes en paralelo cuando las superficies son independientes, hace merge si hay colisiones, y cierra con un único commit + un único mensaje de cierre.
+
+**Decisión**: **C — paralelismo orquestado**.
+
+**Razón**:
+
+- Mantiene los beneficios de "un paso a la vez": un commit por step, docs sincronizadas, mensaje de cierre limpio.
+- Captura la velocidad cuando la estructura del step la permite (frontend + backend, módulos sin archivos compartidos, mockups por surface).
+- Centraliza la responsabilidad de prolijidad en el thread principal (que ya tiene contexto del proyecto), no en cada sub-agente.
+
+**Consecuencias**:
+
+- "Un paso a la vez" se reinterpreta como "**un commit por step**", no como "un agente solo".
+- El "prompt para la próxima sesión" (formato de cierre) puede opcionalmente incluir un breakdown de sub-agentes paralelos cuando aplique.
+- Reglas para el thread principal cuando paraleliza:
+  - Solo paralelizar superficies sin archivos compartidos (típicamente: distintos módulos del backend, distintas carpetas del frontend, frontend vs backend).
+  - Lanzar todos los sub-agentes en un solo mensaje (un bloque con N Agent calls).
+  - Cada sub-agente recibe en su prompt los docs relevantes a leer + las reglas del proyecto + su scope exacto + la prohibición explícita de tocar fuera de su scope o de commitear.
+  - Si dos sub-agentes accidentalmente tocan el mismo archivo (típico: `lib/mock-data.ts`, `app/layout.tsx`, `middleware.ts`), el thread principal hace el merge antes de validar.
+  - El thread principal corre lint + tests + build y commitea una sola vez al final.
+  - Si un sub-agente se traba o tarda, el thread principal lo cancela y cierra el step con lo que esté listo, dejando lo pendiente explícito en `docs/09-progreso.md`.
+- **No paralelizar** cuando: el step toca un solo módulo con muchas dependencias internas (típicamente: auth completa, refactors transversales, cambios al `AppModule`/`AuthModule`/`UsersService` que varios steps consecutivos necesitan), o cuando los sub-agentes necesitarían el output de los otros para arrancar (en ese caso, secuencial).
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)
