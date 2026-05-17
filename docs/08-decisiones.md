@@ -199,4 +199,56 @@ Lock de versiones mayores. Se sube major solo con justificación explícita en A
 
 ---
 
+## ADR-010 — Error shape con `code` parseable + filtro global
+
+**Contexto**: el frontend de signup necesita diferenciar `SLUG_TAKEN` vs `SLUG_RESERVED` para mostrar mensajes distintos (uno sugiere probar otro slug; el otro avisa que está reservado por el sistema). Parsear el `message` por prefijo es frágil y mezcla UX con copy. La convención de `docs/05-api-conventions.md` ya mencionaba `code` para errores de negocio, pero no estaba implementado a nivel filtro global.
+
+**Opciones**:
+
+- Default de NestJS sin filtro custom: `{ statusCode, message, error }`. Sin `code`, sin `timestamp`, sin `path`.
+- Una librería tipo `nestjs-typed-error` o `http-errors-enhanced`. Más infra que valor para 3-4 códigos.
+- Filtro global propio (`apps/api/src/common/filters/http-exception.filter.ts`) que agrega `timestamp` + `path` y propaga el `code` cuando se construyó la excepción con `new HttpException({ code, message })`.
+
+**Decisión**: filtro global propio, registrado vía `APP_FILTER` en `AppModule` (así lo heredan los `TestingModule` de los e2e sin tocar `main.ts`). Los services tiran excepciones de Nest con un objeto que incluye `code` cuando el frontend necesita distinguirlo.
+
+**Razón**:
+
+- Cero deps nuevas.
+- El frontend ya tiene `ApiClientError` tipado que expone `body.code` y mapea a UX.
+- Compatible con el shape estándar: si una excepción no tiene `code` (validación del DTO, 401, 5xx), el body queda como lo deja Nest + `timestamp` + `path`.
+
+**Consecuencias**:
+
+- Los `code` son contrato entre back y front. Renombrar uno es breaking change. La lista vive en `docs/05-api-conventions.md` (sección "Códigos de error") y se actualiza cuando se agrega uno.
+- `message` viene en español desde el API. Si más adelante queremos UI multi-idioma, el frontend traduce por `code` (no por `message`).
+- El filtro está registrado a nivel `AppModule`, no global vía `app.useGlobalFilters` en `main.ts`. Esto asegura que el filtro y el `ValidationPipe` también apliquen en tests e2e que importan `AppModule` directo.
+
+---
+
+## ADR-011 — Subdomain routing en Next: rewrite a `/t/:slug` (sin route groups en el URL)
+
+**Contexto**: `docs/06-frontend-conventions.md` (versión original) proponía que el middleware del frontend reescribiera subdominios a route groups (`(marketing)/(admin)/(student)/...`). Cuando se intentó implementar en Step 4.5 se vio que esto no funciona: las route groups del App Router son organizativas y no aparecen en el URL path, por lo que `NextResponse.rewrite(url)` no puede apuntar a `(student)/foo` — ese path no existe.
+
+**Opciones**:
+
+- Mantener route groups + middleware seteando header `x-tenant-slug`. Para que `/` siga sirviendo distinto según el host, hay que duplicar `page.tsx` en cada grupo y resolver colisiones. Frágil y poco descubrible.
+- Private folder (`_t`) en el App Router. Las private folders quedan fuera del routing por diseño; tampoco se pueden alcanzar con rewrite.
+- Prefijo real en URL: `/t/:slug/...` para tenants, `/admin/...` para admin, `/` para marketing. Las route groups se usan solo como agrupación de layouts dentro de cada prefix.
+
+**Decisión**: prefijo real. El middleware reescribe `<slug>.host/...` → `/t/:slug/...` (y, cuando llegue Step 20, `app.host/...` → `/admin/...`).
+
+**Razón**:
+
+- Es la única que funciona dentro del modelo del App Router.
+- Las URLs públicas siguen siendo limpias porque la reescritura es server-side: el usuario nunca ve `/t/<slug>` en la barra.
+- Route groups quedan disponibles para layout-sharing (compartir un `layout.tsx` entre rutas hermanas), simplemente no se usan para mapear hosts a URLs.
+
+**Consecuencias**:
+
+- El layout del tenant vive en `apps/web/app/t/[slug]/layout.tsx` (cuando se cree), no en `(student)/layout.tsx`.
+- Si en el futuro queremos un path público `/t` real (improbable), hay colisión: habría que renombrar el prefijo a algo más feo.
+- `docs/06-frontend-conventions.md` quedó alineado con esta decisión.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

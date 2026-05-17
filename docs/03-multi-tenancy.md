@@ -24,30 +24,39 @@ Vercel acepta wildcard domains en planes pagos; alternativamente, agregamos los 
 
 ### Middleware Next (`apps/web/middleware.ts`)
 
-Pseudo-código:
+El middleware extrae el slug del subdominio (helper en `apps/web/lib/subdomain.ts`) y **reescribe** la URL al prefijo real `/t/:slug/...`. La detección no llama al API: deja pasar la request y el server component del tenant (`app/t/[slug]/page.tsx`) es el que valida existencia contra `GET /tenants/by-slug/:slug` y dispara `notFound()` si el API responde 404.
 
-```ts
-export function middleware(req: NextRequest) {
-  const host = req.headers.get('host') ?? '';
-  const subdomain = extractSubdomain(host);
+Casos (post-implementación de Step 4.5):
 
-  // Casos:
-  // host = "rutinex.app"          → landing pública, no tenant
-  // host = "app.rutinex.app"      → admin (OWNER/TRAINER), tenant viene del JWT
-  // host = "olimpo.rutinex.app"   → tenant slug = "olimpo"
+| Host                      | Slug        | Resultado                                       |
+| ------------------------- | ----------- | ----------------------------------------------- |
+| `rutinex.app`             | —           | sin rewrite → landing en `/`                    |
+| `www.rutinex.app`         | —           | reservado → landing                             |
+| `app.rutinex.app`         | —           | reservado → admin (Step 20+, todavía sin rutas) |
+| `olimpo.rutinex.app`      | olimpo      | rewrite `/...` → `/t/olimpo/...`                |
+| `olimpo.rutinex.app/foo`  | olimpo      | rewrite `/foo` → `/t/olimpo/foo`                |
+| `inexistente.rutinex.app` | inexistente | rewrite a `/t/inexistente`; la page tira 404    |
 
-  if (!subdomain || subdomain === 'app' || subdomain === 'www') {
-    return NextResponse.next(); // landing o admin
-  }
+Reservados (`www`, `app`) y patrones de host que no matchean `*.localhost` / `*.rutinex.app` no se tratan como tenant. Ver código en `apps/web/lib/subdomain.ts`.
 
-  // Tenant slug. Lo pasamos como header a la app y como cookie para hidratación cliente.
-  const res = NextResponse.next();
-  res.headers.set('x-tenant-slug', subdomain);
-  return res;
-}
+Por qué reescribir a un prefijo real y no a una route group (`(student)/`): las route groups del App Router son organizativas y no aparecen en el URL path, así que `NextResponse.rewrite` no puede apuntarles. Detalle en ADR-011.
+
+### URLs de dev
+
+Chrome y Firefox resuelven `*.localhost` automáticamente. No hace falta tocar `/etc/hosts`. Si en Safari aparece algún problema, usar `*.lvh.me` o `*.localtest.me` como host alternativo (todos resuelven a `127.0.0.1`).
+
+```
+http://localhost:3000               → landing
+http://olimpo.localhost:3000        → tenant "olimpo" (rewrite a /t/olimpo)
+http://www.localhost:3000           → landing (reservado)
+http://inexistente.localhost:3000   → 404 "Este gimnasio no existe"
 ```
 
-El layout del segmento de alumno (`apps/web/app/(student)/layout.tsx`) lee el header y carga el branding del tenant antes de renderizar.
+### CORS
+
+En dev, el API (`apps/api/src/main.ts`) habilita CORS con regex para `localhost` y `*.localhost` en cualquier puerto. Esto cubre el flujo de signup en la landing (`localhost:3000`) y los fetches server-side de la página del tenant (`<slug>.localhost:3000`).
+
+En prod (Step 27) el origin se restringe a `rutinex.app` y `*.rutinex.app`.
 
 ### Validación en el API
 
@@ -98,16 +107,18 @@ TypeORM Subscribers que injecten `tenant_id` automáticamente desde un `AsyncLoc
 }
 ```
 
-El frontend lo lee en el layout del alumno y lo aplica vía CSS variables:
+El frontend lo lee en la página del tenant (server component) y aplica las CSS variables en el `<main>` del tenant (scope local, no global, para no contaminar otras superficies):
 
 ```tsx
-<html style={{
-  '--brand-primary': branding.primaryColor,
-  '--brand-accent': branding.accentColor,
-}}>
+const cssVars = {
+  '--brand-primary': tenant.branding.primaryColor ?? defaultPrimary,
+  '--brand-accent': tenant.branding.accentColor ?? defaultAccent,
+} as React.CSSProperties;
+
+return <main style={cssVars}>...</main>;
 ```
 
-Tailwind se configura para leer esas variables (`tailwind.config.ts` extends con `colors.brand.primary = 'var(--brand-primary)'`).
+Las utilities Tailwind correspondientes (`bg-brand-primary`, `text-brand-primary`) se mapean a esas vars en `apps/web/app/globals.css` vía `@theme inline` (Tailwind 4 — no hay `tailwind.config.ts`). Ver detalle en `docs/06-frontend-conventions.md`.
 
 ## Slug del tenant
 

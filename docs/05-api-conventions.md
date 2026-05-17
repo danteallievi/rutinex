@@ -125,7 +125,7 @@ Todas las responses de un recurso:
 T; // el recurso, sin wrapper
 ```
 
-Errores: formato estándar de NestJS, el filtro global asegura:
+Errores: formato estándar de NestJS, el filtro global (`apps/api/src/common/filters/http-exception.filter.ts`, registrado en `AppModule` vía `APP_FILTER`) asegura:
 
 ```json
 {
@@ -136,6 +136,8 @@ Errores: formato estándar de NestJS, el filtro global asegura:
   "path": "/routines"
 }
 ```
+
+Si la excepción se construyó con un objeto que incluye `code`, el filtro lo propaga al body. Ver "Códigos de error" más abajo.
 
 ## Tenant scoping (ver `docs/03-multi-tenancy.md`)
 
@@ -173,6 +175,20 @@ throw new BadRequestException({
   message: 'La sesión ya fue completada y no se puede modificar.',
 });
 ```
+
+### Códigos de error
+
+Convención: `code` es un `UPPER_SNAKE_CASE` opcional. Se incluye cuando el frontend necesita distinguir un caso del otro a nivel UX (mostrar mensaje distinto, ofrecer acción distinta). Para errores genéricos (validación del DTO, 401, 5xx) no hace falta `code` y se deja el body como lo arme Nest.
+
+`code` es contrato entre back y front: si lo renombrás, es breaking change para el cliente. Decisión ADR-010.
+
+| Status | code               | Caso                                               | Módulo  |
+| ------ | ------------------ | -------------------------------------------------- | ------- |
+| 404    | `TENANT_NOT_FOUND` | `GET /tenants/by-slug/:slug` no existe o no activo | tenants |
+| 409    | `SLUG_RESERVED`    | `POST /tenants` con slug en la lista de reservados | tenants |
+| 409    | `SLUG_TAKEN`       | `POST /tenants` con slug ya existente              | tenants |
+
+> Mantener esta tabla cuando se agreguen códigos nuevos.
 
 ## Logging
 
