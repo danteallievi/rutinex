@@ -856,4 +856,107 @@ Cuando duela (decisión cualitativa: si vemos que el bucket crece desproporciona
 
 ---
 
+## ADR-024 — Routines + RoutineItems: items embebidos atómicos, position normalizada, PATCH replace-all
+
+**Contexto**: el Step 16 expone `POST/GET/PATCH/DELETE /routines` con `routine_items` como tabla hija ordenada. Tres sub-decisiones que no caben en los criterios del roadmap y conviene clavar antes de que Steps 17 (assignments) y 18 (sessions+sets) se construyan encima de la forma del recurso.
+
+**Decisiones**:
+
+### 1. Items embebidos en `POST /routines`, una sola transacción atómica
+
+El body de `POST /routines` trae `{ name, description?, items: [{ exerciseId, position, prescribedSets, prescribedReps, prescribedWeight?, restSeconds?, notes? }] }`. La rutina y todos sus items se persisten dentro de una sola `DataSource.transaction(...)`: si la validación de los `exerciseId` falla a mitad (alguno no pertenece al tenant) o cualquier INSERT rompe, el rollback completo deja el sistema sin rutina huérfana.
+
+Por qué no "crear routine vacía + POST sub-recurso por cada item":
+
+- Una rutina sin items rompe el dominio (la definición de "rutina" es "conjunto ordenado de ejercicios"). Si el endpoint permitiera el estado intermedio, exposes una rutina vacía a clientes lentos durante la ventana entre el create y el primer POST de item.
+- El frontend (Step 24) construye toda la rutina con drag&drop antes de mandarla al API. No necesita streaming.
+- Si más adelante aparece el caso "edit item-por-item" (rutinas muy grandes, reorder optimista), se agrega `POST /routines/:id/items` + `PATCH /routines/:id/items/:itemId` sin breaking change: el `POST /routines` con items embebidos sigue funcionando como el "atómico happy path".
+
+`items` es **requerido** con `@ArrayMinSize(1)` — el DTO rechaza `items: []` con 400 antes de tocar el service.
+
+### 2. `position` int continuo + normalización 1..N en el service, no fractional indexing
+
+`routine_items.position` es `int NOT NULL` con UNIQUE compuesto `(routine_id, position)`. El cliente puede mandar positions arbitrarias (1/2/3, o 10/20/30, o incluso 1.0 si fuera fraccional — aunque el DTO rechaza eso con `@IsInt`); el service ordena por la `position` recibida y **normaliza a 1..N** antes de insertar. El resultado en DB es siempre consecutivo, sin importar qué mandó el cliente.
+
+Por qué no fractional indexing (e.g. inserción 1.5 entre 1 y 2):
+
+- El caso operativo real es "TRAINER arma una rutina con 5-10 ejercicios y la edita ocasionalmente". Concurrencia de reorders sobre la misma rutina es esencialmente nula (un trainer edita una rutina a la vez en el panel).
+- PATCH reemplaza el array completo (sección 3), así que no hay un "insert entre dos existentes" — todo el orden se recalcula en cada update.
+- Fractional indexing complejiza el código (necesita doble precision, lógica para escoger un valor entre dos cercanos, manejo de precision overflow al cabo de muchos inserts) sin ganar nada en el caso real.
+
+Si más adelante aparece edit colaborativo en vivo (improbable; rutinas no son docs colaborativos), se evalúa fractional indexing. Hasta entonces, simple int continuo.
+
+El UNIQUE compuesto `(routine_id, position)` actúa como defensa de integridad por si alguien escribe SQL directo (script de mantenimiento, fix de DBA). El service ya rechaza positions duplicadas con `400 ROUTINE_ITEM_POSITION_DUPLICATED` antes de llegar al constraint — el cliente ve un error parseable, no un `unique_violation` de Postgres.
+
+### 3. PATCH `items` = replace-all del array; PATCH sin `items` deja los existentes intactos
+
+Si `PATCH /routines/:id` trae `items: [...]`, el service hace **delete-then-insert** dentro de la transacción: `DELETE FROM routine_items WHERE routine_id=$1` + `INSERT` del array nuevo. No hay diff incremental.
+
+- **Reorder**: el cliente manda el array completo con las positions reordenadas.
+- **Agregar item**: el cliente manda el array original + el nuevo item al final.
+- **Quitar item**: el cliente manda el array original sin el item removido.
+
+Si `PATCH` no trae `items`, los items existentes quedan intactos — el PATCH sólo actualiza los campos top-level (`name`, `description`).
+
+Por qué replace-all en vez de diff incremental por `id`:
+
+- El contrato API es mucho más simple: el cliente nunca tiene que pensar en "qué items existían antes" — manda el estado final deseado y listo.
+- La operación se mantiene atómica dentro de la transacción.
+- Los `id` de los routine_items son derivados por la DB y no son referenciables desde fuera de la rutina (no aparecen en URLs ni en otras tablas en MVP). Preservar los `id` viejos no aporta nada.
+- Cuando aparezcan `sessions` (Step 18) que referencien `routine_item_id`, esa FK va a tener una semántica "snapshot" (la sesión guarda la rutina ejecutada, no la rutina actual) y se modela aparte — no afecta a este PATCH. Ver `docs/02-dominio.md` sección "Reglas de integridad".
+
+Trade-off: `routine_items.id` no es estable post-PATCH (el viejo se borra, el nuevo es otro UUID aunque el `exerciseId` sea el mismo). Aceptable: no hay clientes que lo necesiten estable hoy. Si Step 18 requiere estabilidad para snapshots, se vuelve a evaluar (típico: el snapshot guarda los datos del item embebidos, no su `id`).
+
+`items` con `@ArrayMinSize(1)` también en `UpdateRoutineDto` — un PATCH no puede vaciar la rutina (rompería el dominio). Para borrar una rutina, `DELETE /routines/:id`.
+
+### 4. `routine_items.tenant_id` denormalizado (NOT NULL)
+
+`routine_items` lleva `tenant_id` (FK RESTRICT a `tenants`) además del `routine_id`. Redundante a nivel lógico (el tenant se infiere via `routine_id → routines.tenant_id`), pero permite:
+
+- Que un futuro `RoutineItemsRepository` extienda `TenantScopedRepository<RoutineItem>` y se beneficie del filtro automático (ADR-002, ADR-018).
+- Queries directas tenant-scoped sobre `routine_items` (e.g. "cuántos items tiene cada rutina del tenant" sin join) son cheap.
+- Defensa en profundidad: si un service hace `DELETE FROM routine_items WHERE id=X` sin filtrar por tenant, el patrón "guard + repo" se preserva.
+
+En MVP el service usa `manager.getRepository(RoutineItem)` directo dentro de transacciones (no necesita el wrapper porque las queries son cortas y siempre filtran por `(tenantId, routineId)`); si más adelante hay queries fuera de transacción, se introduce un `RoutineItemsRepository` extendiendo el wrapper.
+
+### 5. Hard delete (consistente con ADR-022)
+
+`DELETE /routines/:id` ejecuta `DELETE FROM routines WHERE tenant_id=$1 AND id=$2`. El FK `routine_items.routine_id` está marcado `ON DELETE CASCADE`, así que los items se borran automáticamente — no hace falta una transacción manual.
+
+Mientras no exista la tabla `sessions` (Step 18), el hard delete es seguro. Cuando Step 18 introduzca `sessions.routine_id`, esa FK va a tener semántica "snapshot referencial" — el debate "RESTRICT al borrar rutina con sesiones vs. soft delete + snapshot en sessions" lo decidimos ahí, no acá. Hoy el caso no existe.
+
+### 6. Mutabilidad post-asignación: diferida a Step 18
+
+`docs/02-dominio.md` dice "rutinas inmutables una vez referenciadas por una sesión". En Step 16 todavía no existen `sessions`, así que el `PATCH` y `DELETE` no necesitan chequear esa regla. Cuando Step 18 introduzca `sessions`, se decide la política (snapshot vs. RESTRICT vs. versión nueva) y se agrega el guard en `RoutinesService`. No es una decisión que se anticipa porque depende del shape de `sessions`.
+
+### 7. `GET /routines` lista sin items + `itemsCount`, `GET /routines/:id` con items resueltos
+
+`GET /routines` (lista paginada) devuelve sólo metadata (`id`, `name`, `description`, `createdBy`, timestamps) más `itemsCount` (cuántos items tiene cada rutina). No trae el array de items ni los exercises resueltos.
+
+`GET /routines/:id` trae el detalle completo: items ordenados por position, con el `Exercise` resuelto inline en cada item (mismo shape que `ExerciseResponse` del Step 14).
+
+Por qué partir la forma:
+
+- El panel del TRAINER (Step 24) muestra la lista de rutinas con thumbnails ligeros y abre el detalle al click. No necesita los items ni los exercises en el list view; traerlos cuesta N joins + 2N response bytes por nada.
+- El catálogo de exercises crece linealmente con el tenant — una rutina con 10 items mete 10 exercise responses en cada list item. Para un tenant con 50 rutinas de 10 items, el list response es 500× más grande que necesario.
+- Cuando aparezca el caso "lista densa con preview" (improbable; el caso real es lista compacta), se agrega un query param `?include=items` sin breaking change.
+
+`itemsCount` se calcula con un sub-query agregado: `SELECT routine_id, COUNT(*) FROM routine_items WHERE tenant_id=$1 AND routine_id IN (...) GROUP BY routine_id`, mapeado a un `Map<routineId, count>` y persistido en cada `RoutineListItemResponse`.
+
+### 8. Códigos de error nuevos
+
+- **404 `ROUTINE_NOT_FOUND`**: `findOne`/`update`/`delete` cuando el id no existe en el tenant del JWT. Cross-tenant también devuelve 404 (no se filtra existencia, alineado con ADR-018/020/022).
+- **400 `ROUTINE_ITEM_EXERCISE_NOT_FOUND`**: el lookup batch de `exerciseId`s falla — uno o más no pertenecen al tenant. La response incluye los ids faltantes en `message` para que el frontend pueda highlightear el item específico.
+- **400 `ROUTINE_ITEM_POSITION_DUPLICATED`**: dos items con la misma `position` en el body. Rechazado en el service antes de tocar la DB (para que el `code` sea parseable; el constraint UNIQUE de Postgres también lo cubriría pero con un mensaje genérico).
+
+**Consecuencias**:
+
+- `RoutinesController` queda muy delgado (CRUD + `@Roles('OWNER','TRAINER')` en escrituras, sin `@Roles` en lecturas — STUDENT puede leer rutinas, necesario para Step 17/18 cuando vea sus rutinas asignadas). Toda la lógica de transacción + validación de coherencia vive en `RoutinesService`.
+- El patrón "entidad padre + array de items embebidos validados batch" queda establecido. Steps siguientes que tengan formas similares (e.g. `sessions` con `sets`) pueden replicarlo: validación cross-tenant del FK antes del INSERT, transacción atómica, hard delete con CASCADE, lista sin items + count derivado.
+- El UNIQUE `(routine_id, position)` cubre el caso defensivo de que un bug en el service mande positions duplicadas (las normalizaciones a 1..N se hacen una sola vez, pero un edit posterior podría chocar — hoy no pasa porque PATCH es replace-all desde 1..N). Si más adelante aparece reorder atómico per-item, el constraint protege.
+- **Riesgo**: el `routine_items.id` no es estable post-PATCH (sección 3). Si el frontend implementa optimistic updates basados en `id`, hay que pasar al estado consistente leyendo la response del PATCH (que devuelve el array nuevo con ids nuevos). Documentado.
+- **Riesgo**: el costo del `loadItemsCounts` en `GET /routines` es proporcional a `pageSize` (default 20, max 100). Para tenants con muchas rutinas y pageSize=100, son 100 entries en el `IN (...)` — cheap. Si el catálogo crece a miles, se evalúa migrar a un materializado `routines.items_count` mantenido por trigger.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

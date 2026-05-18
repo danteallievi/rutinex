@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 15 completo. Próximo: Step 16 — CRUD Routines + RoutineItems.
-**Última actualización**: 2026-05-18 — Step 15 (Storage de media R2 + ADR-023).
+**Paso actual**: Step 16 completo. Próximo: Step 17 — Asignación de rutina a alumno.
+**Última actualización**: 2026-05-18 — Step 16 (CRUD Routines + RoutineItems + ADR-024).
 
 ## Cambios de doc
 
@@ -728,9 +728,69 @@ Notas:
 - `ExercisesService.update` ya valida coherencia `mediaType`↔`mediaUrl` (ADR-022); como el confirm pasa los dos a la vez derivados del mime real, no puede caer en `EXERCISE_MEDIA_INCONSISTENT` por design. Si en el futuro el confirm permite limpiar media (`null`), revisar.
 - Cleanup de orphans (uploads sin confirm) queda como deuda explícita en ADR-023 — sin cron ni lifecycle rules en MVP. Cuando el bucket crezca, definir la estrategia (preferentemente lifecycle rule de R2 sobre un prefijo `pending/`).
 
+### Step 16 — CRUD: Routines + RoutineItems (2026-05-18)
+
+Entity `Routine` (header) + `RoutineItem` (líneas ordenadas) con CRUD completo, items embebidos en una sola transacción atómica, `position` normalizada a 1..N del lado del service, PATCH replace-all, hard delete con CASCADE. Decisiones cristalizadas en **ADR-024** (items atómicos, position int normalizada, PATCH replace-all, tenant_id denormalizado en items, hard delete, mutabilidad post-asignación diferida a Step 18, lista sin items + itemsCount, códigos de error).
+
+**Entities + migración**: `Routine` en `apps/api/src/modules/routines/entities/routine.entity.ts` con `id`, `tenantId` (uuid NOT NULL + FK RESTRICT a `tenants`), `name` (varchar(255)), `description` (text nullable), `createdBy` (uuid NOT NULL + FK RESTRICT a `users`), timestamps. `RoutineItem` en `entities/routine-item.entity.ts` con `id`, `tenantId` (uuid NOT NULL + FK RESTRICT a `tenants` — denormalizado para defensa en profundidad y futuro `TenantScopedRepository`), `routineId` (uuid NOT NULL + FK CASCADE a `routines` — borrar la rutina arrastra los items), `exerciseId` (uuid NOT NULL + FK RESTRICT a `exercises`), `position` (int), `prescribedSets` (int), `prescribedReps` (varchar(50)), `prescribedWeight` (varchar(50) nullable), `restSeconds` (int nullable), `notes` (text nullable). Índices: `ix_routines_tenant_id`, `ix_routine_items_tenant_id`, `ix_routine_items_routine_id`, `ix_routine_items_exercise_id`, y UNIQUE `uq_routine_items_routine_position` sobre `(routine_id, position)`.
+
+Migración `apps/api/src/migrations/1779360000000-InitRoutines.ts` a mano (mismo patrón que `InitExercises`): crea ambas tablas con FKs nombrados explícito (`fk_routines_tenant`, `fk_routines_created_by`, `fk_routine_items_tenant`, `fk_routine_items_routine`, `fk_routine_items_exercise`), índices, y el UNIQUE como `CREATE UNIQUE INDEX` (no como CONSTRAINT — alineado con el patrón de `users` para que el detector de drift de TypeORM con `@Index({ unique: true })` no marque cambios). Up/down testeados (revert + re-run dejan estado limpio); drift check con `migration:generate` no encuentra cambios.
+
+**`RoutinesRepository`** (`apps/api/src/modules/routines/routines.repository.ts`): `@Injectable()` que extiende `TenantScopedRepository<Routine>` con el constructor estándar de TypeORM 0.3. Sólo aplicado a `Routine` — `RoutineItem` se maneja vía `manager.getRepository(RoutineItem)` dentro de las transacciones del service (las queries siempre filtran por `(tenantId, routineId)`, así que el wrapper sería ceremonia).
+
+**`RoutinesService`** (`apps/api/src/modules/routines/routines.service.ts`):
+
+- `create(tenantId, createdBy, dto)`: validación pre-transacción de positions únicas; dentro de `DataSource.transaction`, lookup batch de `exerciseId`s (`WHERE tenant_id=? AND id IN (?)`) con 400 `ROUTINE_ITEM_EXERCISE_NOT_FOUND` si falta alguno; insert de la routine; insert de items con `position` normalizada a 1..N (sortea por la position recibida, reasigna 1..N preservando orden relativo).
+- `list(tenantId, query)`: `createQueryBuilder` con `tenant_id` como primera cláusula, filtro opcional `q` (ILIKE en `name`), paginación offset (default 20, max 100), orden `createdAt DESC`. Después de obtener las filas, calcula `itemsCount` con un raw `SELECT routine_id, COUNT(*) GROUP BY routine_id` mapeado a un `Map<routineId, number>`; cada `RoutineListItemResponse` lleva el count.
+- `findOne(tenantId, id)`: lookup tenant-scoped; trae items por `(tenantId, routineId)` y los exercises de cada item con un `find` batch (`WHERE tenantId AND id IN (...)`); construye `RoutineResponse` con items ordenados por position + exercise inline.
+- `update(tenantId, id, dto)`: validación de positions duplicadas si viene `items`; dentro de transacción, lookup tenant-scoped (404 si no); si vienen campos top-level (`name`, `description`), update parcial; si viene `items`, lookup batch de exerciseIds, `DELETE FROM routine_items WHERE tenantId AND routineId`, insert del array nuevo normalizado 1..N, y `UPDATE routines SET updatedAt=now()` (el delete/insert de items no dispara `@UpdateDateColumn` del routine padre). Releer el routine para devolverlo con `updatedAt` fresco.
+- `remove(tenantId, id)`: hard delete tenant-scoped (el CASCADE del FK arrastra los items); 404 si `affected=0`.
+
+**`RoutinesController`** (`apps/api/src/modules/routines/routines.controller.ts`):
+
+- `POST /routines` (`@Roles('OWNER','TRAINER')`).
+- `GET /routines` (sin `@Roles` — STUDENT puede leer, necesario para Step 17/18).
+- `GET /routines/:id` (sin `@Roles`).
+- `PATCH /routines/:id` (`@Roles('OWNER','TRAINER')`).
+- `DELETE /routines/:id` (`@Roles('OWNER','TRAINER')`).
+
+Mismo patrón que `ExercisesController` (Step 14, ADR-022): sin `@Roles` a nivel clase, gate per-handler para mantener las lecturas abiertas al STUDENT por ADR-019.
+
+**DTOs** (`apps/api/src/modules/routines/dto/`):
+
+- `RoutineItemInputDto`: `exerciseId` (UUID), `position` (int ≥ 1), `prescribedSets` (int ≥ 1), `prescribedReps` (string 1-50), `prescribedWeight?` (string 1-50, acepta `null`), `restSeconds?` (int ≥ 0, acepta `null`), `notes?` (string ≤ 2000, acepta `null`).
+- `CreateRoutineDto`: `name` (string 1-255), `description?` (string ≤ 5000, acepta `null`), `items` (array de `RoutineItemInputDto`, 1-100, `@ValidateNested`).
+- `UpdateRoutineDto`: todos opcionales con la misma semántica. `items` también `@ArrayMinSize(1)` — un PATCH no puede vaciar la rutina.
+- `ListRoutinesQueryDto`: `q?` (1-255), `page`/`pageSize` (default 1/20, max 100).
+- `RoutineResponse`, `RoutineItemResponse`, `RoutineListItemResponse`, `PaginatedRoutinesResponse` + helpers `toRoutineResponse(routine, items, exercisesById)` y `toRoutineListItemResponse(routine, count)`. Detalle inline: `items: [{ ..., exercise: ExerciseResponse }]`. Lista: sin items, sólo `itemsCount`.
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- **404 `ROUTINE_NOT_FOUND`**: `GET/PATCH/DELETE /routines/:id` cuando el id no existe en el tenant del JWT (cross-tenant también).
+- **400 `ROUTINE_ITEM_EXERCISE_NOT_FOUND`**: uno o más `exerciseId` del array no pertenecen al tenant. La response incluye los ids faltantes en `message`.
+- **400 `ROUTINE_ITEM_POSITION_DUPLICATED`**: dos items con la misma `position`. Rechazado antes del UNIQUE de Postgres para dar un `code` parseable.
+
+**Tests**:
+
+- Unit (`routines.service.spec.ts`, 16 cases): create (atómico happy path, normalización 10/20 → 1/2 preservando orden, 400 exercise foreign, 400 positions duplicadas); list (where tenant_id + paginación + orden + itemsCount, ILIKE para q, lista vacía no consulta counts); findOne (OK + 404); update (sólo top-level no toca items, items reemplaza array + actualiza updatedAt, 404, items con exerciseId foreign, positions duplicadas); remove (OK + 404). Mocks de `DataSource.transaction(...)` que pasan un `manager` con `getRepository(Entity)` redirigido a mocks de Routine/RoutineItem/Exercise.
+- E2E (`routines.e2e-spec.ts`, 29 cases): cubre los 5 endpoints, jerarquía OWNER/TRAINER/STUDENT (STUDENT lee pero no escribe), validaciones (items vacío 400, name faltante 400, no-whitelisted 400, sin x-tenant-slug 400), `ROUTINE_ITEM_EXERCISE_NOT_FOUND` con verificación de rollback (no queda routine huérfana), `ROUTINE_ITEM_POSITION_DUPLICATED`, list (STUDENT lee + itemsCount correcto, ILIKE en name, paginación, tenant isolation), findOne (cross-tenant 404), PATCH (sólo name, replace-all items, reorder, cross-tenant exerciseId 400 + rollback verificado en DB, description=null limpia), DELETE (hard delete + cascade verificado en DB, 403 STUDENT, cross-tenant 404 no afecta otro tenant), 401 sin bearer en GET/POST.
+
+**Wiring**: `RoutinesModule` registra controller + service + `RoutinesRepository` y declara `TypeOrmModule.forFeature([Routine, RoutineItem])`. `AppModule` lo importa. No depende de `ExercisesModule` — usa `dataSource.getRepository(Exercise)` directo para el lookup batch (mismo patrón que `SuperadminTenantsService` con `User`).
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 252/252 (236 previos del Step 15 + 16 nuevos en routines-service). `pnpm --filter @rutinex/api test:e2e` 215/215 (186 previos + 29 nuevos en routines.e2e-spec.ts).
+
+Archivos clave: `apps/api/src/modules/routines/{routines.module,routines.controller,routines.service,routines.service.spec,routines.repository}.ts`, `apps/api/src/modules/routines/entities/{routine,routine-item}.entity.ts`, `apps/api/src/modules/routines/dto/{create-routine,update-routine,list-routines.query,routine-item-input,routine.response}.{dto,ts}`, `apps/api/src/migrations/1779360000000-InitRoutines.ts`, `apps/api/src/app.module.ts` (import del módulo), `apps/api/test/routines.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-024).
+
+Notas:
+
+- Para que TypeORM no marque drift con el UNIQUE compuesto declarado como CONSTRAINT inline en el CREATE TABLE (estilo Step 13), se separó en un `CREATE UNIQUE INDEX` independiente y se declaró en la entity con `@Index('uq_routine_items_routine_position', ['routineId', 'position'], { unique: true })`. Mismo patrón que `users` (ADR-018) — el detector ve un índice y matchea contra el `@Index unique:true` sin pedir `ALTER TABLE`.
+- El `routine_items.id` no es estable post-PATCH (replace-all borra los viejos e inserta nuevos UUIDs). Si Step 18 necesita estabilidad para los snapshots de sesión, se evalúa migrar a diff incremental; hoy la decisión es replace-all por simplicidad (ver ADR-024 sección 3).
+- El FK `routine_items.routine_id` es `ON DELETE CASCADE`: borrar una rutina arrastra sus items sin necesidad de transacción manual en el service. El FK `routine_items.exercise_id` es `RESTRICT` — no se puede borrar un exercise mientras alguna rutina lo referencia (ADR-022 ya impide eso a nivel API; el constraint cierra el gap por SQL directo).
+- `RoutinesService.update` toca `updatedAt` manualmente cuando reemplaza items, porque el `@UpdateDateColumn` de `Routine` no se dispara por delete/insert de la tabla hija. Sin el `update({ id }, { updatedAt: new Date() })`, el `updatedAt` quedaba con el valor previo aunque el contenido cambió.
+
 ## Próxima acción concreta
 
-Step 16 — CRUD Routines + RoutineItems. Entities + migración (rutina con items embebidos ordenados, FKs a `exercises`), endpoints `POST /routines` (con items), `PATCH /routines/:id` (reordenar/agregar/quitar), `GET /routines/:id` con items y ejercicios resueltos. Ver criterios completos en `docs/07-roadmap.md` → Step 16.
+Step 17 — Asignación de rutina a alumno. Entity `Assignment` + migración (FK a `routines` y `users.STUDENT`, `assigned_by`, `starts_on`, `ends_on?`, `weekday_mask`), endpoints `POST /routines/:id/assignments`, `GET /students/:id/assignments`, `DELETE /assignments/:id`. Ver criterios completos en `docs/07-roadmap.md` → Step 17.
 
 ## Pendientes / deudas técnicas
 
