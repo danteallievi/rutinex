@@ -62,6 +62,11 @@ export class TenantScopedRepository<
     return super.count(options);
   }
 
+  override findAndCount(options?: FindManyOptions<T>): Promise<[T[], number]> {
+    if (!hasTenantFilter(options?.where)) return missingTenant('findAndCount');
+    return super.findAndCount(options);
+  }
+
   override countBy(
     where: FindOptionsWhere<T> | FindOptionsWhere<T>[],
   ): Promise<number> {
@@ -97,6 +102,13 @@ export class TenantScopedRepository<
   /** Escape hatch: `count` sin chequeo de tenant. */
   countAcrossTenants(options?: FindManyOptions<T>): Promise<number> {
     return super.count(options);
+  }
+
+  /** Escape hatch: `findAndCount` sin chequeo de tenant. */
+  findAndCountAcrossTenants(
+    options?: FindManyOptions<T>,
+  ): Promise<[T[], number]> {
+    return super.findAndCount(options);
   }
 
   /** Escape hatch: `update` sin chequeo de tenant (típicamente por id global). */

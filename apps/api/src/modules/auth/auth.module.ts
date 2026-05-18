@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
@@ -20,7 +20,7 @@ import { TenantGuard } from './tenant.guard';
 
 @Module({
   imports: [
-    UsersModule,
+    forwardRef(() => UsersModule),
     TenantsModule,
     PassportModule,
     TypeOrmModule.forFeature([RefreshToken]),
@@ -69,6 +69,7 @@ import { TenantGuard } from './tenant.guard';
   ],
   exports: [
     PasswordService,
+    RefreshTokenService,
     JwtAuthGuard,
     SuperadminGuard,
     TenantGuard,

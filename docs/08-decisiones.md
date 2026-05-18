@@ -602,4 +602,78 @@ No filtra existencia ni habilita acceso que no esté ya implícito en el flag `i
 
 ---
 
+## ADR-020 — CRUD users del tenant: jerarquía, scope de listado, soft delete
+
+**Contexto**: el Step 12 implementa el CRUD de `users` del tenant (alta de TRAINER y STUDENT). Los guards globales (Tenant + Roles) gatean el surface, pero hay varias sub-decisiones que dependen de la combinación request/target y no caben en metadata estática. Hay que clavarlas ahora para que Step 12 sea consistente y los siguientes CRUD (Steps 14, 16, etc.) puedan apoyarse en el mismo lenguaje.
+
+**Decisiones**:
+
+### 1. Jerarquía de alta — OWNER crea TRAINER, TRAINER crea STUDENT, fin
+
+- **OWNER** puede crear **TRAINER** (password generada por el sistema, `must_change_password=true`, devuelta en plano una vez).
+- **TRAINER** puede crear **STUDENT** (sin password, login por DNI — ADR-014; `trainer_id` se setea automáticamente al `actor.userId`).
+- **OWNER intentando crear STUDENT** → 403 `FORBIDDEN_ROLE_HIERARCHY`. Razón: en MVP el OWNER no opera con alumnos directamente; la simplicidad del flujo (TRAINER es el único origen de STUDENTs) gana sobre la flexibilidad. Si un OWNER quiere armar rutinas también, se da de alta a sí mismo como TRAINER en un user separado (en MVP un user tiene exactamente un `role`).
+- **TRAINER intentando crear TRAINER u OWNER** → 403 `FORBIDDEN_ROLE_HIERARCHY`. La meta `@Roles('OWNER','TRAINER')` del controller deja pasar a TRAINER (necesario para que pueda crear STUDENTS), pero la combinación role-del-actor × role-del-body la valida el service.
+- **SUPERADMIN/OWNER inicial**: no se crean por `POST /users`. El SUPERADMIN sale del CLI seed (Step 7); el OWNER inicial del tenant sale de `POST /superadmin/tenants` (Step 13).
+
+Las pre-condiciones de DTO (TRAINER requiere email, STUDENT requiere DNI, etc.) están **además** validadas en service para que el código sea defensivo si en el futuro alguien sube el endpoint sin `class-validator`.
+
+### 2. Scope del listado por rol
+
+`GET /users`:
+
+- **OWNER**: ve todos los users del tenant (TRAINERs + STUDENTs + sí mismo + otros OWNERs si los hubiera).
+- **TRAINER**: ve sus propios STUDENTs (`trainer_id = actor.userId`) más a sí mismo. **No** ve otros TRAINERs ni el OWNER. Razón: el TRAINER es operador, no manager — no necesita saber quién más opera en el tenant, y aislar la vista reduce ruido en el panel.
+- **STUDENT**: bloqueado por `@Roles('OWNER','TRAINER')` antes de llegar al service.
+
+Implementación: el service arma un `where` con dos ramas en OR para el caso TRAINER (`[{ tenantId, trainerId: self }, { tenantId, id: self }]`). El `TenantScopedRepository` lo acepta porque ambas ramas filtran por `tenantId`. Los filtros opcionales (`role`, `isActive`) se aplican a las dos ramas: un TRAINER buscando `role=STUDENT` no se ve a sí mismo (su rol es TRAINER) — eso es consistente con la intención del filtro.
+
+### 3. Update y delete: misma jerarquía + restricciones de blast radius
+
+`PATCH /users/:id`:
+
+- OWNER: puede modificar cualquier user del tenant.
+- TRAINER: puede modificar (a) a sí mismo y (b) a sus propios STUDENTs. Cualquier otro target → 403 `FORBIDDEN_ROLE_HIERARCHY`.
+- Sólo se editan `firstName`, `lastName`, `isActive` en MVP. Para cambiar email/DNI/role/trainerId, borrar y volver a crear.
+- Si el update pasa `isActive` de `true` a `false`, el controller revoca todos los refresh tokens del target (no esperamos al refresh siguiente; el OWNER quiere efecto inmediato).
+
+`DELETE /users/:id`:
+
+- Sólo OWNER (cubierto por `@Roles('OWNER')` a nivel handler — gana sobre el `@Roles('OWNER','TRAINER')` de la clase, como confirma el `RolesGuard` con `Reflector.getAllAndOverride([handler, class])`).
+- **No se borra a un OWNER** (incluido sí mismo). Mitigación contra lockout del tenant — si hace falta cambiar el dueño, lo hace el SUPERADMIN en Step 13.
+- Soft delete = `isActive=false`. **No** se agrega columna `deleted_at` en MVP: el toggle es suficiente para los casos prácticos (pausar alumno/entrenador) y evita tocar el schema en un paso de CRUD puro. Si más adelante necesitamos un audit log "este user fue borrado el día X", se agrega la columna con migración explícita.
+- El controller revoca todos los refresh tokens del target después del soft delete — mismo motivo que en update.
+
+### 4. Reset de password — sólo OWNER → TRAINER
+
+`POST /users/:id/reset-password`:
+
+- Sólo OWNER (handler-level `@Roles('OWNER')`).
+- Target debe ser **TRAINER del mismo tenant**:
+  - STUDENT → 400 `USER_NO_PASSWORD` (login por DNI, no hay password que resetear).
+  - OWNER → 403 `FORBIDDEN_ROLE_HIERARCHY` (el reset de OWNER lo hace el SUPERADMIN en Step 13).
+- Genera nueva password (misma política que el alta — ADR-014 + `PasswordService.generate()`), persiste hasheada con `must_change_password=true`, devuelve la plana **una vez**. El controller revoca todos los refresh del target (el OWNER hace reset porque el TRAINER perdió/quiere rotar — las sesiones vivas dejan de ser válidas).
+
+### 5. Códigos de error nuevos
+
+- **403 `FORBIDDEN_ROLE_HIERARCHY`**: emitido por `UsersService` cuando la combinación role-del-actor × role-del-target rompe la jerarquía (puntos 1, 3, 4 de arriba). Separado de `FORBIDDEN_ROLE` (que emite el `RolesGuard` por el meta de `@Roles`) para que el frontend pueda distinguir "no podés tocar este endpoint con tu rol" de "podés tocar el endpoint pero no este target específico".
+- **400 `USER_NO_PASSWORD`**: reset-password sobre STUDENT.
+- **404 `USER_NOT_FOUND`**: el `id` no existe en el tenant del JWT. Cross-tenant también devuelve 404 — el `findOne({ where: { tenantId, id } })` ya filtra por tenant, así que un OWNER de A pidiendo el id de un user de B ve un 404 limpio (no se filtra existencia, alineado con el patrón de ADR-018).
+- **409 `EMAIL_TAKEN` / `DNI_TAKEN`**: ya existían como `code` en el service desde Step 5, pero recién se documentan ahora porque Step 12 los expone públicamente vía `POST /users`.
+
+### 6. Wiring de módulos — `forwardRef` entre `AuthModule` y `UsersModule`
+
+`UsersController` necesita `RefreshTokenService` (revocar sesiones en reset/delete/desactivación) y `UsersService` necesita `PasswordService` (generar + hashear passwords del alta/reset). Ambos viven en `AuthModule`. `AuthModule` ya importa `UsersModule` para `UsersService`. Para resolver la dependencia circular: `forwardRef(() => AuthModule)` en `UsersModule.imports` y `forwardRef(() => UsersModule)` en `AuthModule.imports`. `AuthModule` exporta `RefreshTokenService` además de `PasswordService` y los guards.
+
+Razón de no extraer `PasswordModule` / `RefreshTokenModule`: cero ganancia arquitectónica para MVP. El `forwardRef` resuelve el cycle sin agregar capas. Si en el futuro un tercer módulo necesita `PasswordService` y empieza a haber más cycles, se evalúa extraer; hasta entonces, no.
+
+**Consecuencias**:
+
+- El controller queda muy delgado (orquesta service + refresh-token-service); el service concentra la lógica de jerarquía y los `code`s parseables. Las próximas CRUD (Step 14 exercises, Step 16 routines) pueden replicar el patrón: `@Controller(...)` con `@Roles(...)` clase + handler, service con métodos `*ForActor(...)` que reciben `AuthenticatedUser`.
+- El SUPERADMIN no toca `POST /users` ni el resto del CRUD — vive en `/superadmin/*` (Step 13). En `users` el `RolesGuard` lo bypassa (ADR-019) pero el `TenantGuard` lo corta antes con `TENANT_MISMATCH` porque su `tenantId` es `null`. Bien.
+- **Riesgo**: la decisión de "OWNER no crea STUDENT" es funcional hoy pero podría rotar si aparece el caso PT individual real (un OWNER que es además su propio entrenador). Mitigación: agregar `trainerId?: string` al `CreateUserDto`, permitir que OWNER cree STUDENT si pasa `trainerId` resoluble dentro del tenant. Sin breaking changes (el campo es opcional).
+- **Riesgo**: soft delete por `isActive=false` no preserva un `deleted_at` separado del "pausado por administración". Si el caso "alumno de licencia temporal vs alumno borrado" se vuelve relevante, agregamos columna `deleted_at` + un filtro automático en el repo (otra capa de `TenantScopedRepository`).
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

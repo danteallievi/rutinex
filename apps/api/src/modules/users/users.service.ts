@@ -1,11 +1,24 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { IsNull } from 'typeorm';
+import { IsNull, type FindOptionsWhere } from 'typeorm';
 
+import type { AuthenticatedUser } from '../auth/jwt-payload';
+import { PasswordService } from '../auth/password.service';
+import type { CreateUserDto } from './dto/create-user.dto';
+import type { ListUsersQueryDto } from './dto/list-users.query.dto';
+import type { UpdateUserDto } from './dto/update-user.dto';
+import {
+  toUserResponse,
+  type CreateUserResponse,
+  type PaginatedUsersResponse,
+  type ResetPasswordResponse,
+  type UserResponse,
+} from './dto/user.response';
 import { User, UserRole } from './entities/user.entity';
 import { UsersRepository } from './users.repository';
 
@@ -24,7 +37,10 @@ export interface CreateUserInput {
 
 @Injectable()
 export class UsersService {
-  constructor(private readonly usersRepository: UsersRepository) {}
+  constructor(
+    private readonly usersRepository: UsersRepository,
+    private readonly passwordService: PasswordService,
+  ) {}
 
   /**
    * Busca staff (OWNER/TRAINER) por email dentro de un tenant.
@@ -202,6 +218,301 @@ export class UsersService {
         message: `User "${id}" no encontrado.`,
       });
     }
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 12 — CRUD: Users del tenant (alta de TRAINER y STUDENT)
+  // --------------------------------------------------------------------------
+  //
+  // Estos métodos asumen que el caller (UsersController) ya pasó por:
+  // - JwtAuthGuard (req.user populado)
+  // - TenantGuard (tenantId del JWT matchea x-tenant-slug)
+  // - RolesGuard con @Roles('OWNER','TRAINER') (o un subset en handlers
+  //   específicos como reset/delete que llevan @Roles('OWNER'))
+  //
+  // La validación de jerarquía OWNER↔TRAINER↔STUDENT que no cabe en los
+  // guards (porque depende de la combinación request/target) vive acá y
+  // se expresa como 403 `FORBIDDEN_ROLE_HIERARCHY`. Decisión documentada
+  // en ADR-020.
+
+  /**
+   * Alta de TRAINER (creada por OWNER) o STUDENT (creada por TRAINER).
+   *
+   * - TRAINER: requiere actor.role=OWNER. Password generada por el sistema,
+   *   `must_change_password=true`, devuelta en plano una sola vez.
+   * - STUDENT: requiere actor.role=TRAINER. Sin password (login por DNI,
+   *   ADR-014). `trainer_id` se setea al `actor.userId` (el TRAINER no
+   *   puede asignar al alumno bajo otro TRAINER en MVP).
+   *
+   * OWNER intentando crear STUDENT o TRAINER creando TRAINER/OWNER →
+   * 403 `FORBIDDEN_ROLE_HIERARCHY` (ADR-020).
+   */
+  async createByActor(
+    tenantId: string,
+    actor: AuthenticatedUser,
+    dto: CreateUserDto,
+  ): Promise<CreateUserResponse> {
+    if (dto.role === 'TRAINER') {
+      if (actor.role !== 'OWNER') {
+        throw this.forbiddenHierarchy(
+          'Sólo el OWNER puede crear TRAINERS en este tenant.',
+        );
+      }
+      if (!dto.email) {
+        throw new BadRequestException({
+          code: 'STAFF_EMAIL_REQUIRED',
+          message: 'TRAINER requiere email.',
+        });
+      }
+      if (dto.dni) {
+        throw new BadRequestException({
+          code: 'STAFF_NO_DNI',
+          message: 'TRAINER no lleva DNI en MVP.',
+        });
+      }
+      const plain = this.passwordService.generate();
+      const passwordHash = await this.passwordService.hash(plain);
+      const user = await this.create({
+        tenantId,
+        role: 'TRAINER',
+        email: dto.email,
+        passwordHash,
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        mustChangePassword: true,
+      });
+      return { user: toUserResponse(user), generatedPassword: plain };
+    }
+
+    // dto.role === 'STUDENT'
+    if (actor.role !== 'TRAINER') {
+      throw this.forbiddenHierarchy(
+        'Sólo un TRAINER puede crear STUDENTS bajo su trainer_id.',
+      );
+    }
+    if (!dto.dni) {
+      throw new BadRequestException({
+        code: 'STUDENT_DNI_REQUIRED',
+        message: 'STUDENT requiere DNI.',
+      });
+    }
+    const user = await this.create({
+      tenantId,
+      role: 'STUDENT',
+      dni: dto.dni,
+      email: dto.email ?? null,
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      trainerId: actor.userId,
+    });
+    return { user: toUserResponse(user) };
+  }
+
+  /**
+   * Lista paginada de users del tenant, con scope adicional por rol del caller:
+   *
+   * - OWNER: ve todos los users del tenant (TRAINERs, STUDENTS, y a sí mismo).
+   * - TRAINER: ve sus propios STUDENTS (`trainer_id = actor.userId`) más a
+   *   sí mismo. No ve otros TRAINERs ni el OWNER (ADR-020).
+   *
+   * Filtros opcionales: `role`, `isActive`. Paginación offset (page/pageSize).
+   */
+  async listForActor(
+    tenantId: string,
+    actor: AuthenticatedUser,
+    query: ListUsersQueryDto,
+  ): Promise<PaginatedUsersResponse> {
+    const page = query.page ?? 1;
+    const pageSize = query.pageSize ?? 20;
+
+    const baseFilter: FindOptionsWhere<User> = { tenantId };
+    if (query.role !== undefined) baseFilter.role = query.role;
+    if (query.isActive !== undefined) baseFilter.isActive = query.isActive;
+
+    let where: FindOptionsWhere<User> | FindOptionsWhere<User>[];
+    if (actor.role === 'OWNER') {
+      where = baseFilter;
+    } else if (actor.role === 'TRAINER') {
+      // OR de dos ramas — ambas filtran por tenantId, así que el
+      // TenantScopedRepository no rechaza la query. Si el filter `role`
+      // está activo, la rama "self" lo aplica igual: un TRAINER buscando
+      // `role=STUDENT` no se ve a sí mismo (su rol es TRAINER).
+      where = [
+        { ...baseFilter, trainerId: actor.userId },
+        { ...baseFilter, id: actor.userId },
+      ];
+    } else {
+      // STUDENT no debería llegar (el RolesGuard de la clase corta antes),
+      // pero por defensa devolvemos 403.
+      throw this.forbiddenHierarchy(
+        'Tu rol no puede listar users en este tenant.',
+      );
+    }
+
+    const [rows, total] = await this.usersRepository.findAndCount({
+      where,
+      order: { createdAt: 'DESC' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    });
+
+    return {
+      data: rows.map(toUserResponse),
+      page,
+      pageSize,
+      total,
+    };
+  }
+
+  /**
+   * Actualiza un user del tenant. Sólo `firstName`, `lastName`, `isActive`.
+   *
+   * Jerarquía (ADR-020):
+   * - OWNER: puede actualizar cualquier user del tenant.
+   * - TRAINER: puede actualizar (a) sí mismo, y (b) sus propios STUDENTS
+   *   (`trainer_id = actor.userId`). Cualquier otro target → 403
+   *   `FORBIDDEN_ROLE_HIERARCHY`.
+   *
+   * Si se desactiva el user (isActive false → la fila pasa de true a false),
+   * el caller (controller) es responsable de revocar refresh tokens —
+   * acá sólo persistimos el cambio.
+   */
+  async updateForActor(
+    tenantId: string,
+    actor: AuthenticatedUser,
+    id: string,
+    dto: UpdateUserDto,
+  ): Promise<{ response: UserResponse; deactivated: boolean }> {
+    const target = await this.usersRepository.findOne({
+      where: { tenantId, id },
+    });
+    if (!target) {
+      throw this.userNotFound(id);
+    }
+
+    if (actor.role === 'TRAINER') {
+      const isSelf = target.id === actor.userId;
+      const isOwnStudent =
+        target.role === 'STUDENT' && target.trainerId === actor.userId;
+      if (!isSelf && !isOwnStudent) {
+        throw this.forbiddenHierarchy(
+          'Un TRAINER sólo puede modificar a sí mismo o a sus propios STUDENTS.',
+        );
+      }
+    }
+
+    const partial: Partial<User> = {};
+    if (dto.firstName !== undefined) partial.firstName = dto.firstName;
+    if (dto.lastName !== undefined) partial.lastName = dto.lastName;
+    if (dto.isActive !== undefined) partial.isActive = dto.isActive;
+
+    const deactivated = dto.isActive === false && target.isActive === true;
+
+    if (Object.keys(partial).length > 0) {
+      await this.usersRepository.update({ tenantId, id }, partial);
+    }
+
+    return {
+      response: toUserResponse({ ...target, ...partial }),
+      deactivated,
+    };
+  }
+
+  /**
+   * Soft delete: setea `isActive=false` sobre un TRAINER o STUDENT del tenant.
+   *
+   * Restricciones (ADR-020):
+   * - Sólo OWNER (cubierto por `@Roles('OWNER')` en el controller).
+   * - No se puede borrar otro OWNER (incluido sí mismo). Mitigación contra
+   *   lockout del tenant.
+   *
+   * Idempotente: si el target ya estaba inactivo, igual devuelve éxito. El
+   * caller (controller) revoca refresh tokens después de este método.
+   */
+  async removeForActor(
+    tenantId: string,
+    actor: AuthenticatedUser,
+    id: string,
+  ): Promise<void> {
+    const target = await this.usersRepository.findOne({
+      where: { tenantId, id },
+    });
+    if (!target) {
+      throw this.userNotFound(id);
+    }
+    if (target.role === 'OWNER') {
+      throw this.forbiddenHierarchy(
+        'No se puede borrar un OWNER. Pedile al SUPERADMIN si necesitás cambiar el dueño del tenant.',
+      );
+    }
+    if (target.id === actor.userId) {
+      // Por consistencia: aunque el target.role no sea OWNER (no debería
+      // entrar acá un OWNER por la rama de arriba), prevenimos self-delete.
+      throw this.forbiddenHierarchy(
+        'No podés borrarte a vos mismo. Pedile a otro OWNER o al SUPERADMIN.',
+      );
+    }
+    await this.usersRepository.update({ tenantId, id }, { isActive: false });
+  }
+
+  /**
+   * Genera una password nueva para un TRAINER del mismo tenant, la persiste
+   * hasheada con `must_change_password=true` y devuelve la plana **una vez**.
+   *
+   * Reglas (ADR-020 + criterios del Step 12):
+   * - Sólo OWNER (cubierto por `@Roles('OWNER')` en el controller).
+   * - Target debe ser TRAINER del mismo tenant. Si es STUDENT → 400
+   *   `USER_NO_PASSWORD` (los STUDENTS no tienen password — ADR-014).
+   *   Si es OWNER → 403 `FORBIDDEN_ROLE_HIERARCHY` (el reset de OWNERs
+   *   lo maneja el SUPERADMIN en Step 13).
+   *
+   * Después de persistir, el caller (controller) revoca todos los refresh
+   * tokens del target.
+   */
+  async resetTrainerPassword(
+    tenantId: string,
+    id: string,
+  ): Promise<ResetPasswordResponse> {
+    const target = await this.usersRepository.findOne({
+      where: { tenantId, id },
+    });
+    if (!target) {
+      throw this.userNotFound(id);
+    }
+    if (target.role === 'STUDENT') {
+      throw new BadRequestException({
+        code: 'USER_NO_PASSWORD',
+        message: 'Los STUDENTS no tienen password (login por DNI).',
+      });
+    }
+    if (target.role !== 'TRAINER') {
+      throw this.forbiddenHierarchy(
+        'Sólo se puede resetear la password de un TRAINER desde acá. Para el OWNER, usar el panel del SUPERADMIN.',
+      );
+    }
+
+    const plain = this.passwordService.generate();
+    const passwordHash = await this.passwordService.hash(plain);
+    await this.usersRepository.update(
+      { tenantId, id },
+      { passwordHash, mustChangePassword: true },
+    );
+
+    return { generatedPassword: plain };
+  }
+
+  private forbiddenHierarchy(message: string): ForbiddenException {
+    return new ForbiddenException({
+      code: 'FORBIDDEN_ROLE_HIERARCHY',
+      message,
+    });
+  }
+
+  private userNotFound(id: string): NotFoundException {
+    return new NotFoundException({
+      code: 'USER_NOT_FOUND',
+      message: `User "${id}" no encontrado.`,
+    });
   }
 
   private assertValidSuperadmin(input: CreateUserInput): void {

@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 11 completo. Próximo: Step 12 — CRUD: Users del tenant (alta de TRAINER y STUDENT).
-**Última actualización**: 2026-05-17 — Step 11 (RolesGuard global + @Roles decorator + ADR-019 SUPERADMIN bypass).
+**Paso actual**: Step 12 completo. Próximo: Step 13 — Panel superadmin (backend): CRUD tenants + OWNER inicial.
+**Última actualización**: 2026-05-17 — Step 12 (CRUD users del tenant + ADR-020 jerarquía/scope/soft delete).
 
 ## Cambios de doc
 
@@ -506,9 +506,70 @@ Notas:
 - `Reflector.getAllAndOverride([handler, class])` pone el handler primero — así un `@Roles` a nivel handler **gana** sobre un `@Roles` a nivel clase. No es "merge": es "override", lo cual es lo esperable (si declaro a nivel handler, sobreescribo la default de la clase).
 - El guard tira `ForbiddenException` con `code` parseable. El filtro global (`HttpExceptionFilter`) propaga el `code` al body. Sin diferenciación entre "no tiene rol" y "rol no matchea" — el caller siempre ve `FORBIDDEN_ROLE`.
 
+### Step 12 — CRUD: Users del tenant (2026-05-17)
+
+Primer módulo con `@Roles` real apoyado sobre `TenantScopedRepository`. OWNER crea TRAINER (password generada, devuelta una vez, `must_change_password=true`); TRAINER crea STUDENT (sin password, `trainer_id` automático). Decisiones de jerarquía cristalizadas en **ADR-020**.
+
+**Endpoints** (`apps/api/src/modules/users/users.controller.ts`, todos bajo `JwtAuthGuard` + `TenantGuard` + `RolesGuard`):
+
+- `POST /users` (`@Roles('OWNER','TRAINER')`, clase-level): crea TRAINER si actor=OWNER, STUDENT si actor=TRAINER. La jerarquía la valida `UsersService.createByActor` con 403 `FORBIDDEN_ROLE_HIERARCHY` para combinaciones inválidas (OWNER→STUDENT, TRAINER→TRAINER). Para TRAINER: usa `PasswordService.generate()` + `hash`, devuelve `{ user, generatedPassword }` con la pass en plano UNA VEZ. Para STUDENT: sin password, `trainerId = actor.userId`, response sin `generatedPassword`.
+- `GET /users` (`@Roles('OWNER','TRAINER')`): paginación offset (`page`, `pageSize` default 20 max 100), filtros opcionales `role` + `isActive`. **Scope por rol**: OWNER ve todo el tenant; TRAINER ve `trainerId=self OR id=self` (sus STUDENTs + a sí mismo, no otros TRAINERs ni OWNER). Implementado con `findAndCount` y un `where` array OR cuando el actor es TRAINER — ambas ramas filtran por `tenantId`, así que el `TenantScopedRepository` lo acepta.
+- `PATCH /users/:id` (`@Roles('OWNER','TRAINER')`): sólo `firstName`, `lastName`, `isActive`. OWNER puede modificar a cualquiera; TRAINER sólo a sí mismo o a sus STUDENTs (403 `FORBIDDEN_ROLE_HIERARCHY` para todo lo demás). Si el update desactiva (`isActive` true→false), el controller revoca todos los refresh tokens del target.
+- `DELETE /users/:id` (`@Roles('OWNER')`, handler-level — override de la meta de clase): soft delete via `isActive=false`. Bloqueado para target OWNER (403 `FORBIDDEN_ROLE_HIERARCHY`) — mitigación contra lockout del tenant; el cambio de OWNER lo hace el SUPERADMIN. Revoca refresh tokens del target.
+- `POST /users/:id/reset-password` (`@Roles('OWNER')`): genera nueva password con la misma política del alta, persiste hasheada + `must_change_password=true`, devuelve la plana UNA VEZ. Target debe ser TRAINER del mismo tenant: STUDENT → 400 `USER_NO_PASSWORD`; OWNER → 403 `FORBIDDEN_ROLE_HIERARCHY` (lo hace el SUPERADMIN). Revoca refresh tokens del target.
+
+**`UsersService` (extensiones, `apps/api/src/modules/users/users.service.ts`)**:
+
+- `createByActor(tenantId, actor, dto)`: dispatcher por `dto.role`. Para TRAINER: valida `actor.role==='OWNER'`, requiere email, prohibe DNI, genera pass + hash, delega a `create(...)`. Para STUDENT: valida `actor.role==='TRAINER'`, requiere DNI, setea `trainerId=actor.userId`. Devuelve `{ user: UserResponse, generatedPassword? }`.
+- `listForActor(tenantId, actor, query)`: arma el `where` según rol. Offset pagination con `findAndCount`. Mapea a `UserResponse` (sin `password_hash`, sin `isSuperadmin` — superficie tenant-scoped).
+- `updateForActor(tenantId, actor, id, dto)`: lookup tenant-scoped, valida jerarquía cuando actor es TRAINER, aplica partial update sólo de los campos editables, devuelve `{ response, deactivated }` (la flag para que el controller revoque refresh).
+- `removeForActor(tenantId, actor, id)`: lookup, valida que target no sea OWNER ni self, soft delete.
+- `resetTrainerPassword(tenantId, id)`: lookup, valida target.role==='TRAINER', genera + hashea + persiste con `must_change_password=true`.
+
+Los helpers privados `forbiddenHierarchy(message)` y `userNotFound(id)` centralizan los `code`s parseables.
+
+**`PasswordService` ahora se inyecta en `UsersService`** (Step 5 no lo necesitaba; Step 12 sí). Resuelto con `forwardRef` entre `AuthModule` y `UsersModule` (`AuthModule` ya importaba `UsersModule`; `UsersModule` ahora importa `AuthModule` para `PasswordService` + `RefreshTokenService`). `RefreshTokenService` agregado a `AuthModule.exports`.
+
+**`TenantScopedRepository` ampliado** (`apps/api/src/common/repository/tenant-scoped.repository.ts`): nuevo override `findAndCount` que exige tenant filter (igual que `find` + `count`), y nuevo escape hatch `findAndCountAcrossTenants`. Necesario porque `listForActor` usa `findAndCount` para devolver `data + total` en una sola query.
+
+**DTOs y response shapes** (`apps/api/src/modules/users/dto/`):
+
+- `CreateUserDto`: `role` ∈ `'TRAINER' | 'STUDENT'`; `firstName`, `lastName` requeridos; `email` opcional (validado con `IsEmail`); `dni` opcional (numérico, 4-20 chars).
+- `UpdateUserDto`: sólo `firstName`, `lastName`, `isActive`, todos opcionales.
+- `ListUsersQueryDto`: `role`, `isActive` (con transform string→boolean), `page`, `pageSize` con `class-transformer`.
+- `UserResponse` (interface + `toUserResponse(user)` helper): id, role, email, dni, firstName, lastName, trainerId, isActive, mustChangePassword, lastLoginAt, createdAt, updatedAt. Sin `password_hash`, sin `tenantId` redundante, sin `isSuperadmin` (la superficie es tenant-scoped).
+- `CreateUserResponse`, `PaginatedUsersResponse`, `ResetPasswordResponse`: shapes públicas.
+
+**`@CurrentUser()` decorator** (`apps/api/src/modules/auth/current-user.decorator.ts`): inyecta el `AuthenticatedUser` del JWT. Tira 401 explícito si `req.user` no está (defensive — no debería pasar después de `JwtAuthGuard`). Documentado en `docs/04-auth.md`.
+
+**Códigos de error nuevos** (documentados en `docs/05-api-conventions.md`):
+
+- 403 `FORBIDDEN_ROLE_HIERARCHY` — jerarquía role-actor × role-target rota.
+- 400 `USER_NO_PASSWORD` — reset sobre STUDENT.
+- 404 `USER_NOT_FOUND` — id no existe en el tenant del JWT (cross-tenant también 404, no se filtra).
+- 409 `EMAIL_TAKEN` / `DNI_TAKEN` — ya existían como `code` en service desde Step 5; ahora documentados como contrato público.
+
+**Tests**:
+
+- Unit (`users.service.spec.ts`, +25 cases sobre los 32 del Step 5/10 = 57 totales): createByActor TRAINER (alta OK, TRAINER actor 403, sin email 400, con DNI 400), createByActor STUDENT (alta OK con `trainerId` automático, OWNER actor 403, sin DNI 400), listForActor (OWNER scope completo, TRAINER scope con OR de dos ramas, filtros role/isActive, mapeo a UserResponse sin passwordHash), updateForActor (OWNER OK, TRAINER OK sobre self + own student, TRAINER 403 sobre otros, 404, deactivated=false cuando re-activa), removeForActor (TRAINER target OK, OWNER target 403, 404), resetTrainerPassword (OK, STUDENT 400, OWNER 403, 404).
+- E2E (`users.e2e-spec.ts`, 36 cases, primer spec real con tenant fixture multi-actor): cubre los 5 endpoints, jerarquía OWNER↔TRAINER↔STUDENT, scope de listado, paginación, filtros, must_change_password round-trip post-reset, revocación de refresh tokens en update/delete/reset (verificado leyendo `refresh_tokens.revoked_at` + tirando `/auth/refresh` que devuelve 401), cross-tenant (OWNER de A pidiendo recurso de B → 404 USER_NOT_FOUND), TENANT_MISMATCH cuando el slug no matchea, ParseUUIDPipe rechazando ids no-UUID, 401 sin bearer.
+
+Archivos clave: `apps/api/src/modules/users/{users.controller,users.service,users.module}.ts`, `apps/api/src/modules/users/dto/{create-user.dto,update-user.dto,list-users.query.dto,user.response}.ts`, `apps/api/src/modules/auth/{current-user.decorator,auth.module}.ts`, `apps/api/src/common/repository/tenant-scoped.repository.ts`, `apps/api/src/modules/users/users.service.spec.ts`, `apps/api/test/users.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-020).
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 182/182 (157 previos del Step 11 + 25 nuevos en users-service). `pnpm --filter @rutinex/api test:e2e` 117/117 (81 previos + 36 nuevos en users.e2e-spec.ts).
+
+Notas:
+
+- `OTHER_TRAINER_PASSWORD` queda como constante en el E2E (se usa para hashear el password del `otherTrainerA`, aunque no se loguea como él en ningún test — quedó como sembrado para tests futuros que verifiquen cross-trainer en otras superficies). El helper `loginOtherTrainerA` que lo usaba se eliminó al detectar el lint.
+- La transformación de `isActive` (`'true'|'false'` → `boolean`) en `ListUsersQueryDto` se hace con `@Transform` antes de `@IsBoolean` porque NestJS pasa el query string como `string` y `@Type(() => Boolean)` no funciona como uno espera (toda string truthy se convierte a `true`). El callback devuelve `unknown` para que `@IsBoolean` rechace cualquier valor que no sea `'true'`/`'false'` con 400 limpio.
+- `findAndCount` en TypeORM 0.3 devuelve `[rows, total]`. La signatura del wrapper es `Promise<[T[], number]>` con el override correcto.
+- El `forwardRef` entre `AuthModule` y `UsersModule` cierra el cycle sin extraer un `PasswordModule` separado. Si en el futuro un tercer módulo necesita `PasswordService` y aparecen cycles transitivas, se evalúa la extracción.
+- En el controller, los handlers que llevan `@Roles('OWNER')` (delete, reset) overridean a nivel handler la meta de clase `@Roles('OWNER','TRAINER')`. El `RolesGuard` usa `Reflector.getAllAndOverride([handler, class])`, así que handler-level gana — comportamiento confirmado en los E2E (TRAINER llamando DELETE/reset recibe `FORBIDDEN_ROLE`, no `FORBIDDEN_ROLE_HIERARCHY`).
+- `removeForActor` tiene un segundo check `target.id === actor.userId` que en MVP es inalcanzable (sólo OWNER llega por `@Roles('OWNER')`, y si OWNER se intenta borrar a sí mismo cae en el primer check `target.role === 'OWNER'`). Queda como defensa en profundidad para el día que el `@Roles` cambie.
+
 ## Próxima acción concreta
 
-Step 12 — CRUD: Users del tenant. OWNER crea TRAINER (password generada `must_change_password=true`); TRAINER crea STUDENT (sin password, DNI requerido). `POST /users/:id/reset-password` (OWNER → TRAINER del mismo tenant, revoca refresh tokens). `GET /users` con filtros + paginación offset. `PATCH /users/:id` (nombre, isActive). `DELETE /users/:id` (soft delete). Primer módulo con `@Roles` real + ese repositorio usando `TenantScopedRepository`. Ver criterios completos en `docs/07-roadmap.md` → Step 12.
+Step 13 — Panel superadmin (backend): CRUD tenants + OWNER inicial. Mover `POST /tenants` a `POST /superadmin/tenants` con `SuperadminGuard`. Crear tenant + OWNER en una sola transacción (password generada una vez). `GET /superadmin/tenants` con filtro `?active=true|false|all`. `PATCH /superadmin/tenants/:id` para toggle `is_active` y editar branding. `POST /superadmin/tenants/:id/reset-owner-password`. Ver criterios completos en `docs/07-roadmap.md` → Step 13.
 
 ## Pendientes / deudas técnicas
 
