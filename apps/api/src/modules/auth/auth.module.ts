@@ -3,14 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
+import { TypeOrmModule } from '@nestjs/typeorm';
 
 import { TenantsModule } from '../tenants/tenants.module';
 import { UsersModule } from '../users/users.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { RefreshToken } from './entities/refresh-token.entity';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { JwtStrategy } from './jwt.strategy';
 import { PasswordService } from './password.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { SuperadminGuard } from './superadmin.guard';
 
 @Module({
@@ -18,6 +21,7 @@ import { SuperadminGuard } from './superadmin.guard';
     UsersModule,
     TenantsModule,
     PassportModule,
+    TypeOrmModule.forFeature([RefreshToken]),
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
@@ -38,6 +42,7 @@ import { SuperadminGuard } from './superadmin.guard';
   providers: [
     AuthService,
     PasswordService,
+    RefreshTokenService,
     JwtStrategy,
     JwtAuthGuard,
     SuperadminGuard,

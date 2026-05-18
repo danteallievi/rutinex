@@ -65,4 +65,13 @@ export class TenantsService {
   async findBySlugIncludingInactive(slug: string): Promise<Tenant | null> {
     return this.tenantsRepository.findOne({ where: { slug } });
   }
+
+  /**
+   * Devuelve el tenant por id (incluyendo `is_active=false`). Lo usa el flow
+   * de refresh: el `user.tenantId` apunta directo al id del tenant y no hace
+   * falta resolver por slug.
+   */
+  async findByIdIncludingInactive(id: string): Promise<Tenant | null> {
+    return this.tenantsRepository.findOne({ where: { id } });
+  }
 }

@@ -1,12 +1,15 @@
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test, TestingModule } from '@nestjs/testing';
+import cookieParser from 'cookie-parser';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 
 import { AppModule } from './../src/app.module';
+import { RefreshToken } from './../src/modules/auth/entities/refresh-token.entity';
 import { PasswordService } from './../src/modules/auth/password.service';
+import { REFRESH_COOKIE_NAME } from './../src/modules/auth/refresh-token.constants';
 import { seedSuperadmin } from './../src/modules/auth/seed-superadmin';
 import { Tenant } from './../src/modules/tenants/entities/tenant.entity';
 import { User } from './../src/modules/users/entities/user.entity';
@@ -14,6 +17,8 @@ import { UsersService } from './../src/modules/users/users.service';
 
 interface LoginResponseBody {
   accessToken: string;
+  refreshToken: string;
+  refreshTokenExpiresAt: string;
   user: {
     id: string;
     role: 'OWNER' | 'TRAINER' | 'STUDENT' | null;
@@ -42,7 +47,7 @@ const TENANT_HOST = 'olimpo.rutinex.app';
 const OWNER_PASSWORD = 'owner-password-1234';
 const TRAINER_PASSWORD = 'trainer-password-1234';
 
-describe('Auth — Steps 7 & 8 (e2e)', () => {
+describe('Auth — Steps 7, 8 & 9 (e2e)', () => {
   let app: INestApplication<App>;
   let dataSource: DataSource;
   let usersService: UsersService;
@@ -62,6 +67,7 @@ describe('Auth — Steps 7 & 8 (e2e)', () => {
     }).compile();
 
     app = moduleFixture.createNestApplication();
+    app.use(cookieParser());
     await app.init();
 
     dataSource = app.get(DataSource);
@@ -75,7 +81,9 @@ describe('Auth — Steps 7 & 8 (e2e)', () => {
   });
 
   beforeEach(async () => {
-    await dataSource.query('TRUNCATE TABLE "users", "tenants" CASCADE');
+    await dataSource.query(
+      'TRUNCATE TABLE "refresh_tokens", "users", "tenants" CASCADE',
+    );
 
     superadmin = await seedSuperadmin(usersService, passwordService, {
       email: SUPERADMIN_EMAIL,
@@ -561,6 +569,267 @@ describe('Auth — Steps 7 & 8 (e2e)', () => {
         statusCode: 403,
         code: 'NOT_SUPERADMIN',
       });
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // POST /auth/refresh, /auth/logout, /auth/logout-all (Step 9)
+  // --------------------------------------------------------------------------
+
+  describe('Refresh tokens (Step 9)', () => {
+    const tenantLogin = async (
+      email: string,
+      password: string,
+    ): Promise<LoginResponseBody> => {
+      const res = await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('Host', TENANT_HOST)
+        .send({ email, password })
+        .expect(200);
+      return loginBody(res);
+    };
+
+    const findRefreshCookie = (
+      cookies: string | string[] | undefined,
+    ): string | null => {
+      const arr = Array.isArray(cookies) ? cookies : cookies ? [cookies] : [];
+      const match = arr.find((c) => c.startsWith(`${REFRESH_COOKIE_NAME}=`));
+      if (!match) return null;
+      const value = match.split(';')[0]?.split('=')[1];
+      return value ?? null;
+    };
+
+    it('login devuelve refreshToken + setea cookie httpOnly', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('Host', TENANT_HOST)
+        .send({ email: owner.email, password: OWNER_PASSWORD })
+        .expect(200);
+
+      const body = loginBody(res);
+      expect(body.refreshToken).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(body.refreshToken.length).toBeGreaterThan(80);
+      expect(new Date(body.refreshTokenExpiresAt).getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+
+      const setCookie = res.headers['set-cookie'] as
+        | string
+        | string[]
+        | undefined;
+      const cookieValue = findRefreshCookie(setCookie);
+      expect(cookieValue).toBe(body.refreshToken);
+      const cookieHeader = Array.isArray(setCookie)
+        ? (setCookie.find((c) => c.startsWith(`${REFRESH_COOKIE_NAME}=`)) ?? '')
+        : (setCookie ?? '');
+      expect(cookieHeader.toLowerCase()).toContain('httponly');
+      expect(cookieHeader.toLowerCase()).toContain('samesite=lax');
+    });
+
+    it('persiste tenant_id en refresh_tokens (NULL para SUPERADMIN)', async () => {
+      const owner1 = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      const sup = await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('Host', SUPERADMIN_HOST)
+        .send({ email: SUPERADMIN_EMAIL, password: SUPERADMIN_PASSWORD })
+        .expect(200);
+
+      const rows = await dataSource.getRepository(RefreshToken).find();
+      const ownerRow = rows.find((r) => r.userId === owner.id);
+      const supRow = rows.find((r) => r.userId === loginBody(sup).user.id);
+      expect(ownerRow?.tenantId).toBe(tenant.id);
+      expect(supRow?.tenantId).toBeNull();
+      // Sanity: el token plano no debe estar en DB.
+      expect(rows.map((r) => r.tokenHash)).not.toContain(owner1.refreshToken);
+    });
+
+    it('/auth/refresh rota: emite par nuevo y el viejo deja de servir', async () => {
+      const first = await tenantLogin(owner.email!, OWNER_PASSWORD);
+
+      const refreshed = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(200);
+      const second = loginBody(refreshed);
+
+      expect(second.refreshToken).not.toBe(first.refreshToken);
+      expect(second.accessToken).toMatch(/^[\w-]+\.[\w-]+\.[\w-]+$/);
+      expect(second.user.id).toBe(owner.id);
+      expect(second.user.tenant?.id).toBe(tenant.id);
+
+      // El refresh viejo ya no sirve.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(401);
+    });
+
+    it('detección de reuso: si reuso un refresh ya revocado, todos los del user se revocan', async () => {
+      const first = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      // Rota una vez (el primer refresh queda revocado).
+      const rot1 = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(200);
+      const second = loginBody(rot1);
+
+      // Ahora reuso el viejo → 401 + reuse detection.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(401);
+
+      // El refresh "second" debería estar también revocado por la reuse detection.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: second.refreshToken })
+        .expect(401);
+    });
+
+    it('/auth/refresh acepta la cookie httpOnly sin body', async () => {
+      const first = await request(app.getHttpServer())
+        .post('/auth/login')
+        .set('Host', TENANT_HOST)
+        .send({ email: owner.email, password: OWNER_PASSWORD })
+        .expect(200);
+
+      // Mando solo la cookie, body vacío.
+      const refreshed = await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .set(
+          'Cookie',
+          `${REFRESH_COOKIE_NAME}=${loginBody(first).refreshToken}`,
+        )
+        .send({})
+        .expect(200);
+
+      const body = loginBody(refreshed);
+      expect(body.refreshToken).not.toBe(loginBody(first).refreshToken);
+    });
+
+    it('/auth/refresh devuelve 401 si no llega ni body ni cookie', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({})
+        .expect(401);
+    });
+
+    it('/auth/refresh devuelve 401 si el user del refresh está pausado', async () => {
+      const first = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      await usersService.setActive(owner.id, false);
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(401);
+    });
+
+    it('/auth/logout revoca el refresh + es idempotente', async () => {
+      const first = await tenantLogin(owner.email!, OWNER_PASSWORD);
+
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${first.accessToken}`)
+        .send({ refreshToken: first.refreshToken })
+        .expect(204);
+
+      // El refresh ya no sirve.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(401);
+
+      // Llamar logout de nuevo con el mismo refresh sigue siendo 204.
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Authorization', `Bearer ${first.accessToken}`)
+        .send({ refreshToken: first.refreshToken })
+        .expect(204);
+    });
+
+    it('/auth/logout sin Authorization → 401', async () => {
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .send({ refreshToken: 'cualquiera' })
+        .expect(401);
+    });
+
+    it('/auth/logout-all revoca todas las sesiones del user', async () => {
+      // Dos sesiones del owner.
+      const a = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      const b = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      expect(a.refreshToken).not.toBe(b.refreshToken);
+
+      await request(app.getHttpServer())
+        .post('/auth/logout-all')
+        .set('Authorization', `Bearer ${a.accessToken}`)
+        .expect(204);
+
+      // Ninguno de los dos refresh sirve más.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: a.refreshToken })
+        .expect(401);
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: b.refreshToken })
+        .expect(401);
+    });
+
+    it('/auth/logout-all sin Authorization → 401', async () => {
+      await request(app.getHttpServer()).post('/auth/logout-all').expect(401);
+    });
+
+    it('change-password forzado revoca todos los refresh activos del user', async () => {
+      const first = await tenantLogin(
+        trainerWithGeneratedPass.email!,
+        trainerGeneratedPassword,
+      );
+      // Una segunda sesión activa del mismo trainer.
+      const second = await tenantLogin(
+        trainerWithGeneratedPass.email!,
+        trainerGeneratedPassword,
+      );
+      expect(first.user.mustChangePassword).toBe(true);
+
+      await request(app.getHttpServer())
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${first.accessToken}`)
+        .send({ newPassword: 'la-mia-segura-1234' })
+        .expect(204);
+
+      // Los dos refresh (de las dos sesiones) ya no sirven.
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: first.refreshToken })
+        .expect(401);
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: second.refreshToken })
+        .expect(401);
+    });
+
+    it('change-password voluntario también revoca todos los refresh del user', async () => {
+      const a = await tenantLogin(owner.email!, OWNER_PASSWORD);
+      const b = await tenantLogin(owner.email!, OWNER_PASSWORD);
+
+      await request(app.getHttpServer())
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${a.accessToken}`)
+        .send({
+          currentPassword: OWNER_PASSWORD,
+          newPassword: 'la-nueva-1234',
+        })
+        .expect(204);
+
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: a.refreshToken })
+        .expect(401);
+      await request(app.getHttpServer())
+        .post('/auth/refresh')
+        .send({ refreshToken: b.refreshToken })
+        .expect(401);
     });
   });
 });

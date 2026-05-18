@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 8 completo. Próximo: Step 9 — Refresh tokens + rotación + detección de reuso.
-**Última actualización**: 2026-05-17 — Step 8 (login tenant + student-login + change-password + tenant/user inactive + JwtAuthGuard global).
+**Paso actual**: Step 9 completo. Próximo: Step 10 — Multi-tenancy guards + TenantScopedRepository.
+**Última actualización**: 2026-05-17 — Step 9 (refresh tokens rotativos + detección de reuso + logout + logout-all + cookie httpOnly + change-password revoca refresh).
 
 ## Cambios de doc
 
@@ -372,9 +372,54 @@ Notas:
 - El `@Public()` decorator vive en `apps/api/src/modules/auth/` pero lo consumen también `TenantsController` y `AppController`. No genera ciclo de módulos porque el decorator es un standalone (no importa nada de `auth.module`).
 - `MIN_HUMAN_PASSWORD_LENGTH` en `seed-superadmin.ts` ahora es un re-export de `MIN_USER_PASSWORD_LENGTH` (en `password.service.ts`) — un solo lugar de verdad para que CLI seed y `change-password` no driften.
 
+### Step 9 — Auth: refresh tokens + rotación + detección de reuso (2026-05-17)
+
+Refresh tokens rotativos persistidos por hash, con detección de reuso, endpoints de logout, integración en login/student-login y revocación al cambiar password. Cookie httpOnly opcional vía body o cookie (ADR-017).
+
+**Entity + migración**: `RefreshToken` en `apps/api/src/modules/auth/entities/refresh-token.entity.ts` con `id`, `tenant_id` (nullable, FK CASCADE a `tenants`), `user_id` (FK CASCADE a `users`), `token_hash` (varchar(64) UNIQUE), `expires_at`, `revoked_at`, `replaced_by` (FK self SET NULL), `user_agent` (255), `ip` (45), `created_at`. Migración `apps/api/src/migrations/1779200000000-InitRefreshTokens.ts` a mano con FKs nombrados (`fk_refresh_tokens_user`, `fk_refresh_tokens_tenant`, `fk_refresh_tokens_replaced_by`) e índices: `ix_refresh_tokens_tenant_id`, `ix_refresh_tokens_user_id`, `uq_refresh_tokens_token_hash` (UNIQUE), `ix_refresh_tokens_expires_at`. Up/down testeados, drift check limpio.
+
+**`RefreshTokenService`** (`apps/api/src/modules/auth/refresh-token.service.ts`):
+
+- `issue({ userId, tenantId, userAgent, ip })`: genera 64 bytes random base64url (~86 chars), hashea con SHA-256 (64 chars hex) y persiste. Devuelve el plano + `expiresAt` (30d). El plano nunca se persiste ni se loggea.
+- `rotate({ presentedToken, userAgent, ip })`: busca por hash. Si no existe / expirado → 401 genérico. Si **ya estaba revocado** → reuse detection: revoca todos los refresh activos del user, loggea con `Logger` de NestJS (sin volcar el token) y tira 401. Si OK → revoca el viejo, crea el nuevo, setea `replaced_by` del viejo apuntando al nuevo. Devuelve `{ token, expiresAt, userId, tenantId }`.
+- `revoke(presentedToken)`: marca `revoked_at` por hash. No-op si no existe o ya está revocado (no se filtra existencia).
+- `revokeAllForUser(userId)`: marca `revoked_at` en todos los activos del user. Usado por `change-password`, `logout-all` y reuse detection. Constantes en `refresh-token.constants.ts` (`REFRESH_TOKEN_BYTES=64`, `REFRESH_TOKEN_TTL_MS=30d`, `REFRESH_COOKIE_NAME`).
+
+**Endpoints** (`auth.controller.ts`):
+
+- `POST /auth/login` y `POST /auth/student-login`: además del access JWT, devuelven `refreshToken` + `refreshTokenExpiresAt` (ISO) en el body **y** setean cookie `rutinex_refresh` httpOnly.
+- `POST /auth/refresh` (@Public): lee el refresh del body o de la cookie (body prioritario, ver ADR-017). Rota vía `RefreshTokenService.rotate`, luego verifica que `user.isActive` y, si tiene tenant, que `tenant.isActive` — ante cualquier falla revoca el refresh recién emitido y devuelve 401 genérico (no se filtra `USER_INACTIVE` / `TENANT_INACTIVE` desde el refresh). Setea cookie nueva.
+- `POST /auth/logout` (bearer): revoca el refresh del body o cookie. Idempotente: 204 aunque el token no exista o ya esté revocado. Limpia cookie.
+- `POST /auth/logout-all` (bearer): revoca todos los refresh activos del `req.user.userId`. Limpia cookie. 204.
+- `POST /auth/change-password`: el flow del Step 8 sigue igual, pero ahora **revoca todos los refresh tokens del user** en ambos modos (forzado y voluntario), cerrando el TODO sembrado en Step 8. Limpia cookie.
+
+**Cookie httpOnly** (ADR-017): helper `apps/api/src/modules/auth/refresh-cookie.ts` con `setRefreshCookie`, `clearRefreshCookie` y `extractRefreshToken(body, cookies)`. Cookie config: `httpOnly: true`, `sameSite: 'lax'`, `path: '/'`, `secure: NODE_ENV === 'production'`, `domain: process.env.REFRESH_COOKIE_DOMAIN || undefined`, `expires: refresh.expiresAt`. `cookie-parser` agregado a `apps/api` y registrado en `main.ts` + en el `beforeAll` del E2E. CORS de `main.ts` ahora con `credentials: true` para que el web pueda enviar la cookie cross-subdomain. `trust proxy=1` en prod para que `req.ip` venga del `X-Forwarded-For`.
+
+**Helper nuevo en `TenantsService`**: `findByIdIncludingInactive(id)` — el refresh resuelve el tenant del user vía id (no slug). El `findBySlugIncludingInactive` previo se mantiene para el flow de login.
+
+**Decisión**: ADR-017 "Refresh token: body + cookie httpOnly (acepta ambos)" — registra que el server soporta los dos transportes, con el body como prioridad para simplificar mobile/PWA/tests sin sacrificar el XSS-hardening del web.
+
+**Tests**:
+
+- Unit (`refresh-token.service.spec.ts`, 11 cases): issue (token base64url, hash SHA-256, tenant_id nullable, tokens nunca se repiten), rotate (OK, 401 si no existe, reuse detection revoca todos, 401 si expirado), revoke (marca + no-op), revokeAllForUser.
+- Unit (`auth.service.spec.ts`, 23 cases reescritos): los tests previos pasaron a recibir `ctx` y ahora verifican `refreshTokenService.issue`. Sumados los del refresh (OK tenant + SUPERADMIN, 401 + revoca-nuevo si user pausado / tenant pausado / user inexistente, propaga 401 cuando rotate falla), logout / logout-all, y change-password ahora también verifica `revokeAllForUser` en ambos modos.
+- E2E (`auth.e2e-spec.ts`, +13 nuevos = 54 totales): login devuelve `refreshToken` + cookie httpOnly httpOnly/samesite=lax con el mismo valor; `refresh_tokens` row persiste `tenant_id` correcto (NULL para SUPERADMIN); rotación end-to-end (viejo deja de servir); reuse detection (rotar, rotar de nuevo el viejo → 401 + el segundo refresh también queda inválido); refresh con cookie pura sin body; refresh sin token → 401; refresh con user pausado → 401; logout revoca + idempotente; logout sin bearer → 401; logout-all mata todas las sesiones; change-password forzado y voluntario revocan todos los refresh activos del user.
+
+Archivos clave: `apps/api/src/modules/auth/entities/refresh-token.entity.ts`, `apps/api/src/migrations/1779200000000-InitRefreshTokens.ts`, `apps/api/src/modules/auth/{refresh-token.service,refresh-token.constants,refresh-cookie,auth.service,auth.controller,auth.module,jwt-auth.guard}.ts` + sus `*.spec.ts`, `apps/api/src/modules/auth/dto/refresh.dto.ts`, `apps/api/src/modules/tenants/tenants.service.ts` (`findByIdIncludingInactive`), `apps/api/src/main.ts` (cookieParser + CORS credentials + trust proxy), `apps/api/test/auth.e2e-spec.ts`, `apps/api/.env.example` (`REFRESH_COOKIE_DOMAIN`), `docs/04-auth.md`, `docs/05-api-conventions.md`, `docs/08-decisiones.md` (ADR-017).
+
+Verificación: `pnpm lint` clean en root. `pnpm --filter @rutinex/api test` 106/106 (94 previos + 12 nuevos en refresh-token-service + tests reescritos de auth-service). `pnpm --filter @rutinex/api test:e2e` 54/54 (41 previos + 13 nuevos del Step 9).
+
+Notas:
+
+- `expires_at` quedó como `timestamptz` con índice (`ix_refresh_tokens_expires_at`) para que la limpieza futura de tokens expirados sea barata (cron en Step 30 quizá; no se agendó todavía).
+- El JWT del access **no** se revoca cuando se revoca el refresh — sigue funcionando hasta su `exp` (15min). Es deliberado: el frontend mata la sesión al recibir 401 en `/auth/refresh`, no antes. Si en el futuro queremos un access blacklist más agresivo, sumamos un set in-memory; por ahora 15min es aceptable.
+- El reuse detection loggea con `Logger.warn` el `userId` y el `id` del row del refresh reusado — nunca el token plano ni el hash (el hash tampoco es sensible, pero no aporta nada al logs).
+- `req.ip` en E2E llega como `::ffff:127.0.0.1` (IPv6-mapped IPv4 de supertest); por eso `ip` en la entity es `varchar(45)` (IPv6 cabe en 39, redondeado).
+- El handler `change-password` ahora llama `clearRefreshCookie(res)` después del revoke-all (la sesión del browser queda forzada al re-login), pero el body sigue siendo 204 sin body. El frontend tiene que loguear de nuevo después.
+
 ## Próxima acción concreta
 
-Step 9 — Refresh tokens: entity + migración (`refresh_tokens` con `tenant_id` nullable para SUPERADMINs), `POST /auth/refresh` con rotación, `POST /auth/logout` + `POST /auth/logout-all`, detección de reuso (si llega un refresh ya revocado, revocar todos los del user), cookie httpOnly secure `SameSite=Lax` scope `.rutinex.app`. El TODO sembrado en `change-password` ("revocar refresh tokens") se completa en este step.
+Step 10 — Multi-tenancy guards + `TenantScopedRepository`: `TenantGuard` global que valide `x-tenant-slug` vs JWT (skipea `/superadmin/*`), `@TenantId()` decorator, clase base `TenantScopedRepository<T>` que rechace queries sin `tenant_id` filtrado, refactor de services existentes. E2E cross-tenant.
 
 ## Pendientes / deudas técnicas
 

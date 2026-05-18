@@ -463,4 +463,39 @@ Decisión concreta del stack tipográfico inicial:
 
 ---
 
+## ADR-017 — Refresh token: body + cookie httpOnly (acepta ambos)
+
+**Contexto**: el Step 9 introduce refresh tokens rotativos con detección de reuso (ver `docs/04-auth.md` → "Refresh token"). Hay que decidir cómo viaja el refresh entre el server y los clientes. Las dos opciones canónicas:
+
+- **Cookie httpOnly solamente**: server setea cookie `httpOnly secure SameSite=Lax`. El JS del cliente no la ve; el browser la envía automáticamente. Excelente para mitigar XSS robando el refresh, pero fricción real para clientes no-browser (mobile/PWA con storage propio, scripts CLI, tests E2E que no tienen un cookie jar transparente).
+- **Body solamente** (response devuelve `refreshToken`, request lo manda en el body): trivial para mobile y tests; el cliente debe guardarlo en algún lado, lo cual en web significa `localStorage` o memoria, ambos accesibles desde JS y por lo tanto vulnerables a XSS.
+
+Los dos surfaces que importan hoy son web (Step 22) y los E2E que estamos escribiendo en Step 9. Mobile/PWA es post-MVP pero la arquitectura no debe encajonarnos.
+
+**Opciones**:
+
+- **A. Cookie httpOnly únicamente.** Más seguro contra XSS, pero rompe el flujo "supertest sin cookie jar manual" y empuja toda la complejidad a mobile cuando aparezca. El web ya funciona "free" con `credentials: 'include'` en los fetch.
+- **B. Body únicamente.** Más simple para tests/mobile, pero deja el web obligado a guardar el refresh en JS (o renunciar a XSS-hardening en el path donde más duele).
+- **C. Body + cookie (acepta ambos).** Login/student-login/refresh devuelven `refreshToken` **en el body** y **también** setean cookie `rutinex_refresh` httpOnly. Refresh y logout leen el token **del body como prioridad, con cookie como fallback**. Logout/logout-all/change-password limpian la cookie.
+
+**Decisión**: **C — body + cookie, body prioritario**.
+
+**Razón**:
+
+- El web puede ignorar el `refreshToken` del body y dejar que el browser maneje la cookie sola (XSS-hardening al máximo: el JS nunca toca el refresh). En Step 22 el cliente web va a hacer `fetch('/auth/refresh', { credentials: 'include' })` con body vacío y todo funciona.
+- Mobile/PWA y los E2E usan el body sin ceremonia, sin tener que orquestar un cookie jar.
+- Los superficies coexisten sin breaking changes: si en el futuro endurecemos a "cookie-only", solo dejamos de incluir `refreshToken` en el body y el web sigue andando; los clientes no-web migran a un mecanismo de storage propio.
+- Implementación cuesta poco: un helper (`refresh-cookie.ts`) que sabe leer body/cookie y setear/limpiar la cookie, más `cookie-parser` en `main.ts`. CORS pasa a `credentials: true` para que el web pueda mandar la cookie cross-subdomain.
+
+**Consecuencias**:
+
+- `main.ts` agrega `app.use(cookieParser())` y CORS con `credentials: true`. En prod, `app.set('trust proxy', 1)` para que `req.ip` se persista correcto en `refresh_tokens.ip`.
+- Cookie config: `httpOnly: true`, `sameSite: 'lax'`, `path: '/'`. `secure` se prende automáticamente cuando `NODE_ENV === 'production'`. `domain` se controla con `REFRESH_COOKIE_DOMAIN` (típicamente `.rutinex.app` en prod para compartir entre `<slug>.rutinex.app` y `superadmin.rutinex.app`). En dev queda sin domain.
+- Logout/logout-all/change-password limpian la cookie. Si llega un logout con bearer válido pero sin refresh ni en body ni en cookie, igual responde 204 (idempotente, no se filtra existencia de tokens).
+- El body de login/student-login/refresh sumó dos campos: `refreshToken` (string) y `refreshTokenExpiresAt` (ISO timestamp). El front puede ignorarlos si confía en la cookie.
+- **Riesgo CSRF**: con cookies de credenciales no-readable + `SameSite=Lax`, un POST cross-site no lleva la cookie (Lax excluye top-level navigations sólo en GET). El único vector remanente sería un mismo eTLD+1 hostil, que no existe en nuestro modelo (`*.rutinex.app` lo controlamos). Si en el futuro queremos un blindaje extra, sumar un CSRF token rotativo en login (no se justifica para MVP). El refresh nunca incluye datos del cliente, sólo rota — el daño potencial es "alguien me hace renovar el token en mi nombre", que es benigno.
+- **Riesgo "doble fuente"**: si un cliente buggy manda body y la cookie tiene un token distinto, el body gana. Documentado y testeado.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

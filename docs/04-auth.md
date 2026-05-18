@@ -6,7 +6,7 @@
 - **Passport** con dos strategies: `local` (login con email+password) y `jwt` (validar bearer token en cada request autenticada).
 - **Passwords** hasheadas con **Argon2id** (parámetros conservadores: memoryCost=19456, timeCost=2, parallelism=1 → mínimo OWASP 2024).
 - **Tokens**: access token corto (15min) + refresh token largo (30 días), rotativo.
-- **Refresh tokens** en DB con hash, no en cookie firmada. Permite revocación inmediata.
+- **Refresh tokens** en DB con hash SHA-256, no en cookie firmada. Permite revocación inmediata, detección de reuso y rotación atómica. Transportados al cliente por **body + cookie httpOnly** (ver ADR-017).
 - **Onboarding sales-led**: no hay signup público. Los tenants y sus OWNERs los crea el SUPERADMIN desde su panel. Ver ADR-012.
 - **STUDENTS sin password**: se loguean por DNI dentro del subdominio de su tenant. Ver ADR-014.
 
@@ -50,10 +50,12 @@ Firmado con HS256 y secret de env (`JWT_ACCESS_SECRET`). El secret se rota cada 
 
 ### Refresh token
 
-- Opaque token (no JWT): 64 bytes random base64url.
-- Se guarda en `refresh_tokens` con el hash SHA-256 del token (no el token plano).
-- Cliente lo guarda en httpOnly secure cookie (web) o en secure storage (mobile/PWA fase 2).
+- Opaque token (no JWT): **64 bytes random base64url** (~86 chars sin padding). Generado con `crypto.randomBytes` y nunca persistido en plano.
+- Se guarda en `refresh_tokens` con el **hash SHA-256 hex de 64 chars** del token (no el token plano).
+- TTL: **30 días** (`REFRESH_TOKEN_TTL_MS` en `apps/api/src/modules/auth/refresh-token.constants.ts`).
+- **Transporte cliente ↔ server** (ADR-017): el server devuelve `refreshToken` en el body de login/student-login/refresh **y también** setea una cookie httpOnly `rutinex_refresh` (ver "Cookie de refresh" abajo). El server lee el refresh del **body como prioridad, con la cookie como fallback**, así el web puede ignorar el body y operar sólo con la cookie, mientras que mobile/PWA/tests usan el body directo.
 - Mismas refresh tokens para users de tenant y para SUPERADMINs (`tenant_id` de la fila puede ser NULL para SUPERADMINs, igual que en `users`).
+- En cada emisión se guardan `user_agent` (truncado a 255 chars) e `ip` (`req.ip`; en prod requiere `trust proxy=1` para que venga del `X-Forwarded-For`) para que más adelante se pueda mostrar "Mis sesiones" en el panel del user.
 
 **Tabla `refresh_tokens`**:
 
@@ -117,6 +119,8 @@ Aplica cuando se crea un OWNER (por SUPERADMIN), un TRAINER (por OWNER), o se re
 
 10. Frontend: si `mustChangePassword=true`, redirige a `/change-password` (modo forzado) antes de mostrar el resto del surface.
 
+> Shape exacto del body (Step 9, sales-led): además de los campos arriba, la response incluye `refreshToken` (string opaque, 86 chars) y `refreshTokenExpiresAt` (ISO timestamp). El web puede ignorarlos y operar sólo con la cookie httpOnly (ver ADR-017). El response shape vive como `LoginResponse` en `apps/api/src/modules/auth/auth.service.ts` — fuente de verdad para el frontend.
+
 ### Login de STUDENT (por DNI)
 
 1. Cliente: `POST /auth/student-login { dni }`. Slug viene del header `x-tenant-slug` (subdominio).
@@ -130,19 +134,27 @@ Aplica cuando se crea un OWNER (por SUPERADMIN), un TRAINER (por OWNER), o se re
 
 ### Refresh (rotación)
 
-1. Cliente: `POST /auth/refresh { refreshToken }`.
+1. Cliente: `POST /auth/refresh` — refreshToken en body o cookie `rutinex_refresh` (ADR-017). Endpoint público (no requiere bearer).
 2. Hashear refreshToken → buscar en DB.
-3. Si no existe / expirado / revocado → 401.
-4. Si está OK: revocar (set `revoked_at`), crear uno nuevo, setear `replaced_by` en el viejo.
-5. Devolver nuevo par `{ accessToken, refreshToken }`.
-
-**Detección de reuso**: si llega un refresh que ya está revocado, es señal de que alguien lo robó y lo usó después. Acción: revocar **todos** los refresh tokens del usuario y forzar re-login. Loggear como incidente.
+3. Si no existe / expirado → 401 genérico (`INVALID_CREDENTIALS`).
+4. Si el refresh **ya estaba revocado** → **detección de reuso**: revocar todos los refresh activos del user, loggear como incidente (`Logger` de NestJS, sin volcar el token) y devolver 401 genérico.
+5. Si está OK: revocar (set `revoked_at`), crear uno nuevo, setear `replaced_by` del viejo apuntando al nuevo.
+6. Resolver `user` con `findById` + tenant si aplica. Si user o tenant están pausados / no existen → revocar el refresh recién emitido y devolver 401 genérico (sin filtrar `USER_INACTIVE` / `TENANT_INACTIVE` desde el refresh — esos códigos son del login).
+7. Devolver `LoginResponse` con `accessToken` + `refreshToken` nuevos + `user` actualizado. Setear cookie `rutinex_refresh` con el nuevo.
 
 ### Logout
 
-1. Cliente: `POST /auth/logout` con bearer + refreshToken en body.
-2. Marcar `revoked_at` en el refresh.
-3. 204.
+1. Cliente: `POST /auth/logout` con bearer. Refresh por body o cookie (ADR-017).
+2. Si hay refresh: marcar `revoked_at`. Si no hay, o el refresh no matchea, igual responder 204 (idempotente, no se filtra existencia).
+3. Limpiar cookie `rutinex_refresh`.
+4. 204.
+
+### Logout en todos los devices
+
+1. Cliente: `POST /auth/logout-all` con bearer (sin body).
+2. Revocar todos los refresh tokens activos del `req.user.userId`.
+3. Limpiar cookie `rutinex_refresh`.
+4. 204.
 
 ### Change password
 
@@ -154,8 +166,9 @@ Mismo endpoint, dos modos según `users.must_change_password`. La fortaleza mín
 2. Validar fortaleza de la nueva (`MIN_USER_PASSWORD_LENGTH`, ver arriba).
 3. Hashear con Argon2id.
 4. Update `users.password_hash` + `must_change_password=false`.
-5. Revocar todos los refresh tokens del user (forzar re-login en otros devices) — implementado en Step 9, no en Step 8.
-6. Devolver 204.
+5. Revocar todos los refresh tokens del user (forzar re-login en otros devices).
+6. Limpiar cookie `rutinex_refresh`.
+7. Devolver 204.
 
 **Voluntario (`must_change_password=false`)**:
 
@@ -163,8 +176,9 @@ Mismo endpoint, dos modos según `users.must_change_password`. La fortaleza mín
 2. Si falta `currentPassword` → 400 `CURRENT_PASSWORD_REQUIRED`.
 3. Verificar `currentPassword` con Argon2. Si no matchea → 401 genérico (`INVALID_CREDENTIALS`).
 4. Hashear nueva. Update `users.password_hash`.
-5. Revocar todos los refresh tokens del user (Step 9).
-6. Devolver 204.
+5. Revocar todos los refresh tokens del user.
+6. Limpiar cookie `rutinex_refresh`.
+7. Devolver 204.
 
 > Decisión: **no usamos magic links ni activation tokens** para el primer login. La password generada que se entrega por WhatsApp ya cumple ese rol y simplifica el modelo (un solo flujo de auth, sin tabla de tokens de activación). Ver ADR-013.
 
@@ -209,7 +223,7 @@ Orden de guards: `JwtAuthGuard` → (`SuperadminGuard` para `/superadmin/*` | `T
 - **No revelar si el email/DNI existe** en login. Mensajes genéricos (`401 invalid credentials`) tanto para user inexistente como para password incorrecta.
 - **CORS**: el API solo acepta requests desde `*.rutinex.app` y `localhost:3000` + `*.localhost:3000` (dev). Configurado en `main.ts`.
 - **CSRF**: no aplica si usamos `Authorization: Bearer` desde JS (no cookies en cross-site con credentials). Si en algún punto pasamos a sessions con cookie, agregar protección CSRF.
-- **Cookies de refresh**: `httpOnly`, `secure`, `SameSite=Lax`, scope al subdominio root `.rutinex.app` para que funcione cross-subdominio (incluido `superadmin.rutinex.app`).
+- **Cookie de refresh** (`rutinex_refresh`, ADR-017): `httpOnly`, `secure` (en prod), `SameSite=Lax`, `path=/`, scope al subdominio root `.rutinex.app` (controlado por `REFRESH_COOKIE_DOMAIN`) para que funcione cross-subdominio incluido `superadmin.rutinex.app`. En dev local va sin domain (aplica al subdominio actual; alcanza para probar el flujo). Setea expiración al `expires_at` del refresh en DB (30d). El web puede operar **sólo** con la cookie (ignorando el `refreshToken` del body); mobile/PWA/tests usan el body.
 - **Secrets**: `JWT_ACCESS_SECRET`, `JWT_REFRESH_PEPPER` (sal extra para hash de refresh), `ARGON2_PEPPER` opcional. En `.env`, nunca en código.
 - **Tiempo constante** en comparación de password: lo da Argon2 nativamente.
 

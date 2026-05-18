@@ -16,6 +16,17 @@ import type { StudentLoginDto } from './dto/student-login.dto';
 import { extractTenantSlug, isSuperadminHost } from './host';
 import type { JwtAccessPayload } from './jwt-payload';
 import { PasswordService } from './password.service';
+import { RefreshTokenService } from './refresh-token.service';
+
+/**
+ * Datos del cliente (user agent + IP) que el controller extrae del request
+ * y pasa al service para persistir en `refresh_tokens` y dejar trazabilidad
+ * de "mis sesiones".
+ */
+export interface ClientContext {
+  userAgent: string | null;
+  ip: string | null;
+}
 
 interface LoginResponseTenant {
   id: string;
@@ -24,12 +35,14 @@ interface LoginResponseTenant {
 }
 
 /**
- * Shape de la response del login. Step 9 va a agregar `refreshToken`.
+ * Shape de la response del login y del refresh.
  *
  * Fuente: `docs/04-auth.md` → "Flujos / Login".
  */
 export interface LoginResponse {
   accessToken: string;
+  refreshToken: string;
+  refreshTokenExpiresAt: string;
   user: {
     id: string;
     role: UserRole | null;
@@ -47,6 +60,7 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly tenantsService: TenantsService,
     private readonly passwordService: PasswordService,
+    private readonly refreshTokenService: RefreshTokenService,
     private readonly jwtService: JwtService,
   ) {}
 
@@ -56,13 +70,17 @@ export class AuthService {
    * - `<slug>.<...>` con slug válido → flujo tenant (OWNER/TRAINER).
    * - Cualquier otro host → 401 genérico (no se filtra existencia).
    */
-  async login(hostname: string | null, dto: LoginDto): Promise<LoginResponse> {
+  async login(
+    hostname: string | null,
+    dto: LoginDto,
+    ctx: ClientContext,
+  ): Promise<LoginResponse> {
     if (isSuperadminHost(hostname)) {
-      return this.loginSuperadmin(dto);
+      return this.loginSuperadmin(dto, ctx);
     }
     const slug = extractTenantSlug(hostname);
     if (slug) {
-      return this.loginTenantUser(slug, dto);
+      return this.loginTenantUser(slug, dto, ctx);
     }
     throw this.invalidCredentials();
   }
@@ -74,6 +92,7 @@ export class AuthService {
   async studentLogin(
     hostname: string | null,
     dto: StudentLoginDto,
+    ctx: ClientContext,
   ): Promise<LoginResponse> {
     if (isSuperadminHost(hostname)) {
       throw this.invalidCredentials();
@@ -82,7 +101,66 @@ export class AuthService {
     if (!slug) {
       throw this.invalidCredentials();
     }
-    return this.loginStudent(slug, dto);
+    return this.loginStudent(slug, dto, ctx);
+  }
+
+  /**
+   * Rota un refresh token y emite un par nuevo (`accessToken` + `refreshToken`).
+   *
+   * Fallas posibles → todas 401 genérico:
+   * - El refresh no existe / está expirado.
+   * - El refresh ya estaba revocado → reuse detection: el service revoca todos
+   *   los refresh activos del user.
+   * - El user no existe / está inactivo.
+   * - El user tiene tenant pausado / inexistente.
+   *
+   * En los últimos dos casos revocamos el refresh recién emitido (no queremos
+   * dejar un token vivo de un user pausado).
+   */
+  async refresh(
+    presentedToken: string,
+    ctx: ClientContext,
+  ): Promise<LoginResponse> {
+    const rotated = await this.refreshTokenService.rotate({
+      presentedToken,
+      userAgent: ctx.userAgent,
+      ip: ctx.ip,
+    });
+
+    const user = await this.usersService.findById(rotated.userId);
+    if (!user || !user.isActive) {
+      await this.refreshTokenService.revoke(rotated.token);
+      throw this.invalidCredentials();
+    }
+
+    let tenant: Tenant | null = null;
+    if (user.tenantId) {
+      tenant = await this.tenantsService.findByIdIncludingInactive(
+        user.tenantId,
+      );
+      if (!tenant || !tenant.isActive) {
+        await this.refreshTokenService.revoke(rotated.token);
+        throw this.invalidCredentials();
+      }
+    }
+
+    const accessToken = await this.signAccessToken(user, tenant);
+    return this.assembleResponse(user, tenant, accessToken, rotated);
+  }
+
+  /**
+   * Revoca un refresh token. Si el token no existe o ya estaba revocado,
+   * es no-op (sin filtrar existencia). Bearer requerido en el endpoint.
+   */
+  async logout(presentedToken: string): Promise<void> {
+    await this.refreshTokenService.revoke(presentedToken);
+  }
+
+  /**
+   * Revoca todos los refresh tokens activos del user del JWT. Bearer requerido.
+   */
+  async logoutAll(userId: string): Promise<void> {
+    await this.refreshTokenService.revokeAllForUser(userId);
   }
 
   /**
@@ -94,8 +172,8 @@ export class AuthService {
    *   `currentPassword`; si falta, 400 `CURRENT_PASSWORD_REQUIRED`. Si no
    *   matchea, 401 genérico.
    *
-   * Step 9 va a sumar la revocación de todos los refresh tokens del user
-   * (forzar re-login en otros devices). La tabla todavía no existe.
+   * En ambos modos, revoca todos los refresh tokens del user (Step 9), forzando
+   * re-login en otros devices.
    */
   async changePassword(userId: string, dto: ChangePasswordDto): Promise<void> {
     const user = await this.usersService.findById(userId);
@@ -126,10 +204,13 @@ export class AuthService {
 
     const newHash = await this.passwordService.hash(dto.newPassword);
     await this.usersService.setPassword(user.id, newHash);
-    // TODO Step 9: revocar todos los refresh tokens del user.
+    await this.refreshTokenService.revokeAllForUser(user.id);
   }
 
-  private async loginSuperadmin(dto: LoginDto): Promise<LoginResponse> {
+  private async loginSuperadmin(
+    dto: LoginDto,
+    ctx: ClientContext,
+  ): Promise<LoginResponse> {
     const user = await this.usersService.findSuperadminByEmail(dto.email);
     if (!user || !user.passwordHash) {
       throw this.invalidCredentials();
@@ -144,12 +225,13 @@ export class AuthService {
     if (!valid) {
       throw this.invalidCredentials();
     }
-    return this.buildResponse(user, null);
+    return this.buildResponse(user, null, ctx);
   }
 
   private async loginTenantUser(
     slug: string,
     dto: LoginDto,
+    ctx: ClientContext,
   ): Promise<LoginResponse> {
     const tenant = await this.tenantsService.findBySlugIncludingInactive(slug);
     if (!tenant) {
@@ -176,12 +258,13 @@ export class AuthService {
     if (!valid) {
       throw this.invalidCredentials();
     }
-    return this.buildResponse(user, tenant);
+    return this.buildResponse(user, tenant, ctx);
   }
 
   private async loginStudent(
     slug: string,
     dto: StudentLoginDto,
+    ctx: ClientContext,
   ): Promise<LoginResponse> {
     const tenant = await this.tenantsService.findBySlugIncludingInactive(slug);
     if (!tenant) {
@@ -200,13 +283,28 @@ export class AuthService {
     if (!student.isActive) {
       throw this.userInactive();
     }
-    return this.buildResponse(student, tenant);
+    return this.buildResponse(student, tenant, ctx);
   }
 
   private async buildResponse(
     user: User,
     tenant: Tenant | null,
+    ctx: ClientContext,
   ): Promise<LoginResponse> {
+    const accessToken = await this.signAccessToken(user, tenant);
+    const refresh = await this.refreshTokenService.issue({
+      userId: user.id,
+      tenantId: user.isSuperadmin ? null : (tenant?.id ?? user.tenantId),
+      userAgent: ctx.userAgent,
+      ip: ctx.ip,
+    });
+    return this.assembleResponse(user, tenant, accessToken, refresh);
+  }
+
+  private async signAccessToken(
+    user: User,
+    tenant: Tenant | null,
+  ): Promise<string> {
     const isSuperadmin = user.isSuperadmin;
     const payload: JwtAccessPayload = {
       sub: user.id,
@@ -214,9 +312,20 @@ export class AuthService {
       role: isSuperadmin ? null : user.role,
       isSuperadmin,
     };
-    const accessToken = await this.jwtService.signAsync(payload);
+    return this.jwtService.signAsync(payload);
+  }
+
+  private assembleResponse(
+    user: User,
+    tenant: Tenant | null,
+    accessToken: string,
+    refresh: { token: string; expiresAt: Date },
+  ): LoginResponse {
+    const isSuperadmin = user.isSuperadmin;
     return {
       accessToken,
+      refreshToken: refresh.token,
+      refreshTokenExpiresAt: refresh.expiresAt.toISOString(),
       user: {
         id: user.id,
         role: isSuperadmin ? null : user.role,
