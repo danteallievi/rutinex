@@ -23,8 +23,20 @@ import {
   extractRefreshToken,
   setRefreshCookie,
 } from './refresh-cookie';
+import { SkipTenantGuard } from './skip-tenant-guard.decorator';
 
+/**
+ * Surface auth — todas las rutas son cross-tenant por diseño:
+ * - Login/student-login resuelven el tenant desde el host (no header).
+ * - Refresh/logout operan sobre el JWT del user (no tocan DB de tenant).
+ * - Change-password idem.
+ *
+ * Por eso aplicamos `@SkipTenantGuard()` a nivel controller: ninguna ruta
+ * acá necesita `x-tenant-slug`. JwtAuthGuard sigue corriendo (cuando
+ * corresponde, vía `@Public()` se skipea también).
+ */
 @Controller('auth')
+@SkipTenantGuard()
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 

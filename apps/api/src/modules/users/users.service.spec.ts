@@ -4,25 +4,29 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { getRepositoryToken } from '@nestjs/typeorm';
 import { IsNull } from 'typeorm';
 
 import { User, UserRole } from './entities/user.entity';
+import { UsersRepository } from './users.repository';
 import { CreateUserInput, UsersService } from './users.service';
 
 type MockRepo = {
   findOne: jest.Mock;
+  findOneAcrossTenants: jest.Mock;
   create: jest.Mock;
   save: jest.Mock;
   update: jest.Mock;
+  updateAcrossTenants: jest.Mock;
 };
 
 function makeMockRepo(): MockRepo {
   return {
     findOne: jest.fn(),
+    findOneAcrossTenants: jest.fn(),
     create: jest.fn((input: Partial<User>) => input as User),
     save: jest.fn((input: User) => Promise.resolve(input)),
     update: jest.fn(),
+    updateAcrossTenants: jest.fn(),
   };
 }
 
@@ -77,10 +81,7 @@ describe('UsersService', () => {
   beforeEach(async () => {
     repo = makeMockRepo();
     const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        UsersService,
-        { provide: getRepositoryToken(User), useValue: repo },
-      ],
+      providers: [UsersService, { provide: UsersRepository, useValue: repo }],
     }).compile();
 
     service = module.get<UsersService>(UsersService);
@@ -117,6 +118,15 @@ describe('UsersService', () => {
       expect(repo.findOne).toHaveBeenCalledWith({
         where: { tenantId: TENANT_ID, dni: '12345678', role: 'STUDENT' },
       });
+    });
+
+    it('findById usa el escape hatch findOneAcrossTenants (cross-tenant explícito)', async () => {
+      repo.findOneAcrossTenants.mockResolvedValueOnce(null);
+      await service.findById('user-id');
+      expect(repo.findOneAcrossTenants).toHaveBeenCalledWith({
+        where: { id: 'user-id' },
+      });
+      expect(repo.findOne).not.toHaveBeenCalled();
     });
   });
 
@@ -345,17 +355,17 @@ describe('UsersService', () => {
   });
 
   describe('setActive', () => {
-    it('actualiza is_active y propaga el cambio', async () => {
-      repo.update.mockResolvedValueOnce({ affected: 1 });
+    it('actualiza is_active vía escape hatch (update por id global)', async () => {
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 1 });
       await service.setActive('user-id', false);
-      expect(repo.update).toHaveBeenCalledWith(
+      expect(repo.updateAcrossTenants).toHaveBeenCalledWith(
         { id: 'user-id' },
         { isActive: false },
       );
     });
 
     it('tira NotFoundException si no afecta filas', async () => {
-      repo.update.mockResolvedValueOnce({ affected: 0 });
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 0 });
       await expect(service.setActive('missing', true)).rejects.toThrow(
         NotFoundException,
       );
@@ -363,20 +373,38 @@ describe('UsersService', () => {
   });
 
   describe('setMustChangePassword', () => {
-    it('actualiza el flag', async () => {
-      repo.update.mockResolvedValueOnce({ affected: 1 });
+    it('actualiza el flag vía escape hatch', async () => {
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 1 });
       await service.setMustChangePassword('user-id', false);
-      expect(repo.update).toHaveBeenCalledWith(
+      expect(repo.updateAcrossTenants).toHaveBeenCalledWith(
         { id: 'user-id' },
         { mustChangePassword: false },
       );
     });
 
     it('tira NotFoundException si no afecta filas', async () => {
-      repo.update.mockResolvedValueOnce({ affected: 0 });
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 0 });
       await expect(
         service.setMustChangePassword('missing', true),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe('setPassword', () => {
+    it('actualiza password_hash + must_change_password=false en una sola sentencia', async () => {
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 1 });
+      await service.setPassword('user-id', 'nuevo-hash');
+      expect(repo.updateAcrossTenants).toHaveBeenCalledWith(
+        { id: 'user-id' },
+        { passwordHash: 'nuevo-hash', mustChangePassword: false },
+      );
+    });
+
+    it('tira NotFoundException si no afecta filas', async () => {
+      repo.updateAcrossTenants.mockResolvedValueOnce({ affected: 0 });
+      await expect(service.setPassword('missing', 'hash')).rejects.toThrow(
+        NotFoundException,
+      );
     });
   });
 });

@@ -4,10 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, Repository } from 'typeorm';
+import { IsNull } from 'typeorm';
 
 import { User, UserRole } from './entities/user.entity';
+import { UsersRepository } from './users.repository';
 
 export interface CreateUserInput {
   tenantId: string | null;
@@ -24,10 +24,7 @@ export interface CreateUserInput {
 
 @Injectable()
 export class UsersService {
-  constructor(
-    @InjectRepository(User)
-    private readonly usersRepository: Repository<User>,
-  ) {}
+  constructor(private readonly usersRepository: UsersRepository) {}
 
   /**
    * Busca staff (OWNER/TRAINER) por email dentro de un tenant.
@@ -46,6 +43,10 @@ export class UsersService {
    * Busca un SUPERADMIN por email (matchea el índice parcial único
    * `users_email_global_unique`). Devuelve solo filas con
    * `tenant_id IS NULL` y `is_superadmin=true`.
+   *
+   * Filtra por `tenantId: IsNull()`, lo cual el `TenantScopedRepository`
+   * acepta — buscar tokens/users de SUPERADMIN es un caso legítimo y el
+   * filtro NULL es explícito.
    */
   async findSuperadminByEmail(email: string): Promise<User | null> {
     return this.usersRepository.findOne({
@@ -68,10 +69,11 @@ export class UsersService {
   /**
    * Busca un user por su id (sin filtrar por tenant). Lo usa `change-password`
    * para resolver el user autenticado por el JWT. Cualquier rol — incluido
-   * SUPERADMIN — entra por acá.
+   * SUPERADMIN — entra por acá, por eso es un escape-hatch explícito del
+   * `TenantScopedRepository`.
    */
   async findById(id: string): Promise<User | null> {
-    return this.usersRepository.findOne({ where: { id } });
+    return this.usersRepository.findOneAcrossTenants({ where: { id } });
   }
 
   /**
@@ -148,10 +150,16 @@ export class UsersService {
   }
 
   /**
-   * Prende/apaga al user (toggle del `is_active`).
+   * Prende/apaga al user (toggle del `is_active`). El criteria es por `id` y
+   * no incluye `tenant_id` — el caller (típicamente un service interno o el
+   * flow de auth) ya verificó que el user le pertenece. Usa el escape hatch
+   * `updateAcrossTenants` explícitamente.
    */
   async setActive(id: string, isActive: boolean): Promise<void> {
-    const result = await this.usersRepository.update({ id }, { isActive });
+    const result = await this.usersRepository.updateAcrossTenants(
+      { id },
+      { isActive },
+    );
     if (result.affected === 0) {
       throw new NotFoundException({
         code: 'USER_NOT_FOUND',
@@ -165,7 +173,7 @@ export class UsersService {
    * generada (alta o reset) y por el `change-password` forzado al limpiarlo.
    */
   async setMustChangePassword(id: string, value: boolean): Promise<void> {
-    const result = await this.usersRepository.update(
+    const result = await this.usersRepository.updateAcrossTenants(
       { id },
       { mustChangePassword: value },
     );
@@ -180,13 +188,11 @@ export class UsersService {
   /**
    * Actualiza `password_hash` y limpia `must_change_password` en la misma
    * sentencia (atomico). Lo usa `POST /auth/change-password` para ambos
-   * modos (forzado y voluntario).
-   *
-   * Step 9 va a sumar la revocación de refresh tokens; por ahora la tabla
-   * `refresh_tokens` no existe.
+   * modos (forzado y voluntario). Va por id (el JWT autenticó al user); usa
+   * el escape hatch `updateAcrossTenants`.
    */
   async setPassword(id: string, passwordHash: string): Promise<void> {
-    const result = await this.usersRepository.update(
+    const result = await this.usersRepository.updateAcrossTenants(
       { id },
       { passwordHash, mustChangePassword: false },
     );

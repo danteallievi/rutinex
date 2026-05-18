@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 9 completo. Próximo: Step 10 — Multi-tenancy guards + TenantScopedRepository.
-**Última actualización**: 2026-05-17 — Step 9 (refresh tokens rotativos + detección de reuso + logout + logout-all + cookie httpOnly + change-password revoca refresh).
+**Paso actual**: Step 10 completo. Próximo: Step 11 — Roles y guard de roles.
+**Última actualización**: 2026-05-17 — Step 10 (TenantGuard global + TenantScopedRepository + decoradores @TenantId/@SkipTenantGuard + refactor UsersService).
 
 ## Cambios de doc
 
@@ -417,9 +417,61 @@ Notas:
 - `req.ip` en E2E llega como `::ffff:127.0.0.1` (IPv6-mapped IPv4 de supertest); por eso `ip` en la entity es `varchar(45)` (IPv6 cabe en 39, redondeado).
 - El handler `change-password` ahora llama `clearRefreshCookie(res)` después del revoke-all (la sesión del browser queda forzada al re-login), pero el body sigue siendo 204 sin body. El frontend tiene que loguear de nuevo después.
 
+### Step 10 — Multi-tenancy guards + TenantScopedRepository (2026-05-17)
+
+`TenantGuard` global validando `x-tenant-slug` contra el JWT, `TenantScopedRepository` blindando queries sin `tenant_id`, decoradores `@TenantId()` y `@SkipTenantGuard()`, refactor del `UsersService` para usar el wrapper con escape hatches explícitos. Sin endpoints nuevos en `src/` — el controller sintético para tests vive sólo en el spec E2E.
+
+**`TenantScopedRepository<T>`** en `apps/api/src/common/repository/tenant-scoped.repository.ts`: extiende `Repository<T>` (TypeORM) y devuelve `Promise.reject(Error)` en `find`, `findOne`, `findBy`, `findOneBy`, `count`, `countBy`, `update`, `delete` cuando el `where`/`criteria` no incluye `tenantId` ni `tenant_id`. Para arrays (OR), exige que **todos** los brazos filtren por tenant (un brazo sin filtro filtra todo). Tira `Error` plano (no `HttpException`) para que el filtro global no lo transforme — es un bug de programación, queremos stack trace ruidoso.
+
+Escape hatches con sufijo `AcrossTenants` (`findAcrossTenants`, `findOneAcrossTenants`, `countAcrossTenants`, `updateAcrossTenants`, `deleteAcrossTenants`, `saveAcrossTenants`): no chequean tenant. El nombre largo es deliberado (warning visual en code review). Ver ADR-018.
+
+**`UsersRepository`** (`apps/api/src/modules/users/users.repository.ts`): `@Injectable()` que extiende `TenantScopedRepository<User>` con el constructor estándar de TypeORM 0.3 (`super(User, dataSource.createEntityManager())`). Registrado en `UsersModule.providers` y consumido por `UsersService` reemplazando el `@InjectRepository(User)` previo. `UsersService` ahora usa los escape hatches explícitamente: `findById` → `findOneAcrossTenants`, `setActive/setMustChangePassword/setPassword` → `updateAcrossTenants` (todos los updates son por id, el caller validó autorización antes).
+
+**`TenantGuard`** (`apps/api/src/modules/auth/tenant.guard.ts`): guard global registrado vía `APP_GUARD` después del `JwtAuthGuard` en `AuthModule.providers` (el orden de NestJS respeta el orden de registración — Jwt primero, Tenant después). Skipea (en este orden):
+
+1. `@Public()` — endpoints sin auth.
+2. Path `/superadmin/*` (chequeo: `path === '/superadmin' || path.startsWith('/superadmin/')` — `'/superadminish'` NO matchea).
+3. `@SkipTenantGuard()` — endpoints autenticados sin contexto de tenant.
+
+Para el resto: exige header `x-tenant-slug`, lo normaliza (`trim().toLowerCase()`), busca `TenantsService.findBySlugIncludingInactive(slug)`. Si no resuelve a un tenant cuyo `id` matchee `req.user.tenantId` → 403 `TENANT_MISMATCH` (colapsa "slug inexistente" + "slug de otro tenant" para no filtrar existencia, ADR-018). Si matchea pero `tenant.isActive=false` → 403 `TENANT_INACTIVE` (igual que en login). Si no llega header → 400 `TENANT_SLUG_REQUIRED`.
+
+**Decoradores nuevos**:
+
+- `@SkipTenantGuard()` (`skip-tenant-guard.decorator.ts`): meta key `'skipTenantGuard'`. Ortogonal a `@Public()` — éste skipea ambos guards globales; aquél sólo el `TenantGuard`. Aplicado a nivel **clase** en `AuthController` (todas las rutas de auth son cross-tenant por diseño: login resuelve por host, refresh/logout/change-password operan sobre el JWT del user).
+- `@TenantId()` (`tenant-id.decorator.ts`): `createParamDecorator` que devuelve `req.user.tenantId` (string no-null). Si no hay tenant en el JWT (típicamente porque un SUPERADMIN tocó por error una ruta tenant-scoped — el `TenantGuard` ya debería haber tirado 403 antes, pero defensive), tira 401 `INVALID_CREDENTIALS`.
+
+**Sin endpoints nuevos en `src/`**. El test E2E del guard usa un **controller sintético** definido directamente en `apps/api/test/tenant-guard.e2e-spec.ts` (`@Controller('test-tenant-guard') class TenantScopedTestController { @Get('me') me(@TenantId() tenantId) { return { tenantId }; } }`) wrapeado en un `TestAppModule` que importa `AppModule` y suma el controller. Step 12 (CRUD users) es el primer endpoint real tenant-scoped.
+
+**`TenantsService` y `RefreshTokenService` no se refactorizan**: `tenants` no tiene `tenant_id` (es la tabla raíz); `refresh_tokens` lo tiene pero todas sus queries son por `token_hash` o `user_id` (no por tenant). Forzar escape hatches en cada query sería ceremonia sin valor. El wrapper aplica a tablas donde el **caso común** es tenant-scoped — `users` (la mayoría de los lookups son por `(tenant_id, email|dni)`), y en el futuro `exercises`, `routines`, etc.
+
+**Códigos de error nuevos** (documentados en `docs/05-api-conventions.md`):
+
+- 400 `TENANT_SLUG_REQUIRED` — `TenantGuard` sin header.
+- 403 `TENANT_MISMATCH` — slug no resuelve al tenant del JWT (colapsa inexistente + ajeno).
+
+**Tests**:
+
+- Unit (`tenant-scoped.repository.spec.ts`, 19 cases): rechaza find/findOne/findBy/findOneBy/count/countBy/update/delete sin tenantId (cada uno verificado que NO delega a super); acepta con tenantId (delega correctamente); OR rechaza si un brazo no filtra (incluido array vacío); IsNull() en tenantId vale como filtro; los 5 escape hatches no chequean. Spies sobre `Repository.prototype` para no necesitar una DataSource real.
+- Unit (`tenant.guard.spec.ts`, 13 cases): skip rules (Public, SkipTenantGuard, /superadmin exactamente y con subpath, NO /superadminish); validación (401 sin user, 400 sin slug, 400 con slug vacío, 403 MISMATCH si el slug no existe, 403 MISMATCH si pertenece a otro tenant, 403 INACTIVE si matchea pero pausado, 200 si matchea y activo, SUPERADMIN → 403 MISMATCH, normalización case-insensitive + trim del slug).
+- Unit (`users.service.spec.ts`, +5 cases): findById ahora usa `findOneAcrossTenants`; setActive/setMustChangePassword/setPassword usan `updateAcrossTenants`. Resto de los casos del Step 5 no regresionan.
+- E2E (`tenant-guard.e2e-spec.ts`, 12 cases): controller sintético en el fixture. OWNER de A con slug=A → 200 + el tenantId del JWT en el body; OWNER de A con slug=B → 403 MISMATCH; OWNER de A con slug inexistente → 403 MISMATCH (sin filtrar); OWNER de A con slug=A pero tenant pausado mid-request → 403 INACTIVE; SUPERADMIN tocando ruta tenant-scoped → 403 MISMATCH; SUPERADMIN tocando `/superadmin/ping` sin slug → 200 (skip por path); `/auth/change-password` (autenticado, sin slug) → respuesta del handler (no TENANT_SLUG_REQUIRED, confirma que `@SkipTenantGuard` corta antes); `/tenants/by-slug` (@Public) y `/` (@Public) → 200 sin nada. Sin Authorization → 401 (JwtAuthGuard corre antes).
+
+**Decisión**: ADR-018 "Tenant scoping: `TenantGuard` global + `TenantScopedRepository`" — registra (1) las tres categorías de skip y por qué `@SkipTenantGuard` es ortogonal a `@Public`; (2) el colapso `TENANT_MISMATCH` entre inexistente y ajeno; (3) el patrón del wrapper extendiendo `Repository<T>` con escape hatches `AcrossTenants`; (4) por qué `tenants`/`refresh_tokens` no usan el wrapper.
+
+Archivos clave: `apps/api/src/common/repository/{tenant-scoped.repository,tenant-scoped.repository.spec}.ts`, `apps/api/src/modules/auth/{tenant.guard,tenant.guard.spec,skip-tenant-guard.decorator,tenant-id.decorator,auth.module,auth.controller}.ts`, `apps/api/src/modules/users/{users.repository,users.module,users.service,users.service.spec}.ts`, `apps/api/test/tenant-guard.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-018), `docs/09-progreso.md`.
+
+Verificación: `pnpm lint` clean en root. `pnpm --filter @rutinex/api test` 146/146 (106 previos del Step 9 + 19 nuevos en tenant-scoped-repository + 13 nuevos en tenant-guard + 5 nuevos en users-service + 3 sumados del test de setPassword/find by id de UsersService que antes no estaban). `pnpm --filter @rutinex/api test:e2e` 66/66 (54 previos + 12 nuevos del tenant-guard).
+
+Notas:
+
+- El controller sintético `test-tenant-guard` vive **sólo** en el spec E2E — no contamina `src/`. Cuando entren los CRUD reales (Step 12), pueden borrarse esos tests (el guard queda cubierto por los E2E de los endpoints reales) o dejarse como red de seguridad básica.
+- `req.path` en `TenantGuard` lee el path **antes** de cualquier rewrite. Nest/Express lo expone con el formato `/foo/bar` (sin query). El chequeo `path.startsWith('/superadmin/')` es robusto contra trailing slashes (NestJS los normaliza).
+- El wrapper no protege queries con `createQueryBuilder()` ni `repo.query('SELECT ...')`. La convención sigue siendo "nunca tirar SQL sin `WHERE tenant_id` salvo justificación explícita". Si el riesgo crece, sumamos un linter custom.
+- El refactor de `UsersService` cambió la inyección: antes `@InjectRepository(User) repo: Repository<User>`; ahora `UsersRepository` como provider concreto en `UsersModule`. Los tests del service pasaron de mockear via `getRepositoryToken(User)` a mockear via `UsersRepository`. Sin cambios funcionales — sólo de cableado.
+
 ## Próxima acción concreta
 
-Step 10 — Multi-tenancy guards + `TenantScopedRepository`: `TenantGuard` global que valide `x-tenant-slug` vs JWT (skipea `/superadmin/*`), `@TenantId()` decorator, clase base `TenantScopedRepository<T>` que rechace queries sin `tenant_id` filtrado, refactor de services existentes. E2E cross-tenant.
+Step 11 — Roles y guard de roles: decorator `@Roles('OWNER'|'TRAINER'|'STUDENT')`, `RolesGuard` global que respeta `@Roles` por handler/controller, no aplica a SUPERADMIN (su guard es separado), endpoint dummy protegido por rol para E2E. Ver criterios completos en `docs/07-roadmap.md` → Step 11.
 
 ## Pendientes / deudas técnicas
 

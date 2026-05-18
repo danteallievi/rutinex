@@ -15,6 +15,7 @@ import { JwtStrategy } from './jwt.strategy';
 import { PasswordService } from './password.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { SuperadminGuard } from './superadmin.guard';
+import { TenantGuard } from './tenant.guard';
 
 @Module({
   imports: [
@@ -46,11 +47,19 @@ import { SuperadminGuard } from './superadmin.guard';
     JwtStrategy,
     JwtAuthGuard,
     SuperadminGuard,
+    TenantGuard,
+    // Orden de APP_GUARD: NestJS los ejecuta en el orden en que se registran.
+    // JwtAuthGuard primero (popula req.user), TenantGuard después (valida
+    // x-tenant-slug vs req.user.tenantId).
     {
       provide: APP_GUARD,
       useClass: JwtAuthGuard,
     },
+    {
+      provide: APP_GUARD,
+      useClass: TenantGuard,
+    },
   ],
-  exports: [PasswordService, JwtAuthGuard, SuperadminGuard],
+  exports: [PasswordService, JwtAuthGuard, SuperadminGuard, TenantGuard],
 })
 export class AuthModule {}

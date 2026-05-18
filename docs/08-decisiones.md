@@ -498,4 +498,69 @@ Los dos surfaces que importan hoy son web (Step 22) y los E2E que estamos escrib
 
 ---
 
+## ADR-018 — Tenant scoping: `TenantGuard` global + `TenantScopedRepository`
+
+**Contexto**: el Step 10 cablea las dos defensas que el modelo multi-tenant (ADR-002) prometía pero todavía no tenía implementadas: el `TenantGuard` que valida cada request autenticada contra su tenant, y el `TenantScopedRepository` que blinda las queries de DB para que ninguna pueda olvidarse del `tenant_id`. Decidir cómo se manifiestan estas piezas tiene varios sub-puntos.
+
+**Decisiones**:
+
+### 1. `TenantGuard` skip list — tres mecanismos, ortogonales
+
+El guard global skipea tres categorías de rutas:
+
+- **`@Public()`**: rutas sin auth (login, healthcheck, `GET /tenants/by-slug`). Comparte el decorador con `JwtAuthGuard`.
+- **Path `/superadmin/*`**: detectado por prefijo de URL en el guard (`req.path === '/superadmin' || req.path.startsWith('/superadmin/')`). El `SuperadminController` ya está protegido por `SuperadminGuard` y opera cross-tenant por diseño.
+- **`@SkipTenantGuard()`** (nuevo decorador): rutas autenticadas que no viven en contexto de tenant. Aplicado a nivel controller en `AuthController` (login resuelve tenant por host, refresh/logout/change-password operan sobre el JWT del user).
+
+Razón de tener `@SkipTenantGuard()` separado de `@Public()`: son ortogonales. `@Public()` skipea **ambos** guards globales (Jwt y Tenant); `@SkipTenantGuard()` skipea sólo el Tenant. Es decir: una ruta autenticada (JWT requerido) puede no necesitar `x-tenant-slug`. Reusar `@Public()` para eso obligaría a desproteger esas rutas, lo cual está mal.
+
+Detección de path: el guard chequea `req.path === '/superadmin' || req.path.startsWith('/superadmin/')` (no `path.startsWith('/superadmin')` a secas — eso matchearía `/superadminish`, que no es del surface).
+
+### 2. Códigos de error: `TENANT_MISMATCH` colapsa "slug inexistente" + "slug no matchea"
+
+Cuando un user con JWT del tenant A pasa un `x-tenant-slug` que (a) no existe en DB o (b) existe pero pertenece a otro tenant, el guard devuelve **403 `TENANT_MISMATCH`** en los dos casos. **No** se distingue entre los dos.
+
+Razón: distinguir filtra existencia. Si "inexistente" devolviera 404 y "no matchea" devolviera 403, un atacante con un JWT válido podría enumerar slugs de tenants existentes. El colapso es deliberado, aceptando que la distinción a nivel UX no importa (los dos casos llevan al mismo "tu sesión no corresponde a este tenant — re-loguéate").
+
+Códigos nuevos del Step 10:
+
+- **400 `TENANT_SLUG_REQUIRED`**: falta o está vacío el header `x-tenant-slug` en una ruta tenant-scoped.
+- **403 `TENANT_MISMATCH`**: el slug no resuelve a un tenant cuyo `id` matchee `req.user.tenantId`. Cubre "slug inexistente" y "slug pertenece a otro tenant".
+- **403 `TENANT_INACTIVE`** (ya existía en login): slug matchea el JWT pero el tenant tiene `is_active=false`. Igual que el login: leakeamos existencia para el caso "el OWNER legítimo entra durante una pausa", aceptable por UX (el OWNER necesita el mensaje claro).
+
+Cross-tenant resource access (OWNER de A pidiendo `GET /routines/:id` donde el id pertenece a B): NO lo cubre el guard — lo cubre el service, que filtra siempre por `req.user.tenantId` y devuelve 404 si no encuentra. El guard sólo defiende contra reusar el JWT contra otro tenant.
+
+### 3. `TenantScopedRepository` extiende `Repository<T>` con escape hatches
+
+El wrapper override los métodos comunes de TypeORM (`find`, `findOne`, `findBy`, `findOneBy`, `count`, `countBy`, `update`, `delete`) y devuelve `Promise.reject(Error)` si el `where`/`criteria` no incluye `tenantId` o `tenant_id` (en al menos un brazo de un OR; todos los brazos en arrays).
+
+- **Tira `Error`, no `HttpException`**: llegar acá es un bug de programación, no un caso de negocio. Queremos que falle ruidoso (stack trace en logs, no transformado a 500 silencioso por el filtro global). El filtro de `HttpException` no toca `Error` plano, así que se propaga como 500.
+- **`Promise.reject` en lugar de `throw` síncrono**: por consistencia con la signatura de los métodos de `Repository<T>` (todos devuelven `Promise`). Un caller que hace `await repo.find()` recibe una rejection siempre, no un throw síncrono según el bug.
+
+Escape hatches con sufijo `AcrossTenants` (`findAcrossTenants`, `findOneAcrossTenants`, `countAcrossTenants`, `updateAcrossTenants`, `deleteAcrossTenants`, `saveAcrossTenants`): no chequean tenant. **Uso obligatoriamente explícito** — el nombre largo y sufijo `AcrossTenants` actúa como warning de code review: si veo `findOneAcrossTenants`, sé que el caller eligió a propósito una query cross-tenant. Los casos legítimos hoy son:
+
+- `UsersService.findById(id)` (lookup por el JWT del request — cualquier rol, incluido SUPERADMIN).
+- `UsersService.setActive/setPassword/setMustChangePassword(id, ...)` (update por id global; el caller validó autorización antes).
+- En el futuro, queries cross-tenant del SUPERADMIN (Step 13) van a usarlos también.
+
+### 4. `RefreshTokenService` y `TenantsService` **no** usan `TenantScopedRepository`
+
+- `tenants` no tiene `tenant_id` (es la tabla raíz). El wrapper no aplica.
+- `refresh_tokens` tiene `tenant_id` nullable (NULL para tokens de SUPERADMIN, ver Step 9). Pero todas sus queries son por `token_hash` (UNIQUE global) o por `user_id`. Ninguna filtra por `tenant_id` porque no aporta a la lógica del lookup. Forzar al service a usar escape hatches en cada query sería ceremonia sin valor.
+- En resumen: el wrapper es para tablas donde el **caso común** es tenant-scoped. Refresh tokens no califica.
+
+`UsersService` sí: la mayoría de los lookups son `(tenant_id, email)` o `(tenant_id, dni)`. Los que no (SUPERADMIN, lookup por id desde JWT) son explícitamente cross-tenant y usan escape hatches.
+
+**Consecuencias**:
+
+- El `AuthController` lleva `@SkipTenantGuard()` a nivel clase — todas sus rutas son cross-tenant por diseño (login resuelve por host, los demás operan sobre el JWT).
+- Para Step 12+ (CRUD users, exercises, routines, etc.), cada nuevo módulo:
+  - Sus services usan un `Repository` que extiende `TenantScopedRepository<T>` (patrón estándar: `@Injectable() class XxxRepository extends TenantScopedRepository<X> { constructor(ds: DataSource) { super(X, ds.createEntityManager()); } }`).
+  - Sus controllers reciben `@TenantId() tenantId: string` en cada handler tenant-scoped.
+  - El `TenantGuard` global ya valida que el slug del header coincida con el JWT antes de que el handler corra.
+- Si en el futuro queremos AsyncLocalStorage + TypeORM Subscribers (inyección automática de tenant en queries — opción "fase 2" de `docs/03-multi-tenancy.md`), se puede agregar sin tocar la base actual: el wrapper sigue siendo la red de seguridad estática y el subscriber sería una capa adicional dinámica.
+- **Riesgo**: si alguien escribe `repo.query('SELECT * FROM users')` o usa `createQueryBuilder()` directo, el wrapper no protege. Mitigación: code review + la convención de `docs/05-api-conventions.md` ("nunca un service hace `this.repo.find()` sin `where`"). Si el riesgo crece, agregamos un linter custom que detecte query strings con `FROM users` sin `WHERE tenant_id`.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)
