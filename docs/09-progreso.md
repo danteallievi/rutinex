@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 13 completo. Próximo: Step 14 — CRUD Exercises.
-**Última actualización**: 2026-05-18 — Step 13 (panel SUPERADMIN backend + ADR-021).
+**Paso actual**: Step 14 completo. Próximo: Step 15 — Storage de media (R2).
+**Última actualización**: 2026-05-18 — Step 14 (CRUD Exercises + ADR-022).
 
 ## Cambios de doc
 
@@ -618,9 +618,63 @@ Notas:
 - El test E2E del rollback usa un email malformado (`'no-es-email'`) para gatillar el 400 del DTO recién después de que la transacción habría empezado. En la práctica el ValidationPipe global corta antes — el rollback "real" del flujo es defensivo: ningún path conocido lo dispara post-rebajar al DTO, pero la transacción está ahí para cualquier error inesperado de DB después del `INSERT` del tenant (constraint violation en `users`, conexión que muere, etc.).
 - `DataSource.transaction(...)` en TypeORM 0.3 toma un callback `(manager) => Promise<T>`. El service consume `manager.getRepository(Entity)` para los repos transaccionales. Los mocks del spec replican esa interfaz devolviendo los repos jest-mocked desde `getRepository`, lo que evita tener que stubear todo el `EntityManager` real.
 
+### Step 14 — CRUD: Exercises (2026-05-18)
+
+Catálogo de ejercicios per-tenant con CRUD completo. Primer módulo nuevo desde Step 12 en usar `TenantScopedRepository`. STUDENT puede leer; OWNER/TRAINER crean/editan/borran. Decisiones cristalizadas en **ADR-022** (hard delete, lectura para STUDENT, filtro `muscleGroups` con semántica OR, validación de coherencia `mediaType`↔`mediaUrl` con `code` parseable, catálogo per-tenant diferido a global).
+
+**Entity + migración**: `Exercise` en `apps/api/src/modules/exercises/entities/exercise.entity.ts` con `id`, `tenantId` (uuid NOT NULL + FK RESTRICT a `tenants`), `title` (varchar(255)), `description` (text default ''), `mediaUrl` (varchar(1024) nullable), `mediaType` (enum `exercise_media_type`: `video`/`gif`/`image`/`none`, default `none`), `muscleGroups` (text[] default '{}'), `createdBy` (uuid NOT NULL + FK RESTRICT a `users`), timestamps. Índices: `ix_exercises_tenant_id` (btree) y `ix_exercises_muscle_groups` (GIN, para el operador `&&`).
+
+Migración `apps/api/src/migrations/1779280000000-InitExercises.ts` a mano (mismo patrón que `InitUsers`): crea el type enum, crea la tabla con FKs nombrados explícito (`fk_exercises_tenant`, `fk_exercises_created_by`), crea los dos índices. Up/down testeados (revert + re-run dejan estado limpio). Drift check con `migration:generate` no encuentra cambios (el `@Index('ix_exercises_muscle_groups', ['muscleGroups'])` en el entity engaña al detector — TypeORM verifica por columnas, no por método del índice, así que no detecta el GIN como drift).
+
+**`ExercisesRepository`** (`apps/api/src/modules/exercises/exercises.repository.ts`): `@Injectable()` que extiende `TenantScopedRepository<Exercise>` con el constructor estándar de TypeORM 0.3. Sin escape hatches — todas las queries pasan por el wrapper o por `createQueryBuilder` con `.where('exercise.tenant_id = :tenantId')` como primera cláusula.
+
+**`ExercisesService`** (`apps/api/src/modules/exercises/exercises.service.ts`):
+
+- `create(tenantId, createdBy, dto)`: assertion de coherencia mediaType↔mediaUrl, persiste con `createdBy = actor.userId`.
+- `list(tenantId, query)`: `createQueryBuilder` con `tenant_id` siempre primero, filtros opcionales `q` (ILIKE en title) y `muscleGroups` (overlap `&&` contra el GIN), paginación offset, orden `createdAt DESC`. El wrapper `TenantScopedRepository` no chequea QB queries — la convención es que la primera cláusula del where sea siempre el tenant.
+- `findOne(tenantId, id)` / `update(tenantId, id, dto)` / `remove(tenantId, id)`: lookup tenant-scoped, 404 `EXERCISE_NOT_FOUND` si no existe (cross-tenant también devuelve 404 sin filtrar existencia). `update` re-valida coherencia de media combinando el body con el estado existente. `remove` es hard delete (`DELETE FROM exercises WHERE tenant_id=$1 AND id=$2`).
+
+**`ExercisesController`** (`apps/api/src/modules/exercises/exercises.controller.ts`):
+
+- `POST /exercises` (`@Roles('OWNER','TRAINER')`).
+- `GET /exercises` (sin `@Roles` — STUDENT puede leer por ADR-019).
+- `GET /exercises/:id` (sin `@Roles`).
+- `PATCH /exercises/:id` (`@Roles('OWNER','TRAINER')`).
+- `DELETE /exercises/:id` (`@Roles('OWNER','TRAINER')`).
+
+Sin `@Roles` a nivel clase — cada handler declara su gate (los handlers de lectura quedan sin meta, abiertos al tenant entero por la regla "no meta = no gate" del ADR-019).
+
+**DTOs** (`apps/api/src/modules/exercises/dto/`):
+
+- `CreateExerciseDto`: `title` (1-255), `description?` (max 5000), `mediaType` (enum, required), `mediaUrl?` (IsUrl con protocolo http/https, max 1024), `muscleGroups?` (string[], max 20, unique, cada elemento 1-50 chars).
+- `UpdateExerciseDto`: todos opcionales. `mediaUrl` acepta `null` explícito (limpiar) vs `undefined` (no tocar) — el `@ValidateIf((_, value) => value !== null)` permite mandar null sin gatillar `@IsUrl`.
+- `ListExercisesQueryDto`: `q?` (1-255), `muscleGroups?` (acepta CSV `?muscleGroups=chest,triceps` o repetido `?muscleGroups=chest&muscleGroups=triceps` — el `@Transform` normaliza ambos a array), `page`/`pageSize` (default 1/20, max 100).
+- `ExerciseResponse` + `toExerciseResponse(exercise)`: serializa la entity (sin campos privados). `PaginatedExercisesResponse`: shape estándar.
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- **404 `EXERCISE_NOT_FOUND`**: `GET /exercises/:id`, `PATCH /exercises/:id`, `DELETE /exercises/:id` cuando el id no existe en el tenant del JWT (cross-tenant también).
+- **400 `EXERCISE_MEDIA_INCONSISTENT`**: `mediaType=none` con `mediaUrl` presente, o `mediaType=video|gif|image` sin `mediaUrl`.
+
+**Tests**:
+
+- Unit (`exercises.service.spec.ts`, 21 cases): create (mediaType none/video OK, inconsistente en ambos sentidos, default `muscleGroups=[]`), list (where tenant_id + paginación + orden, ILIKE para `q`, `&&` para `muscleGroups`, q/muscleGroups vacíos no agregan filtro, paginación correcta), findOne (OK + 404), update (parcial, inconsistente media, limpiar media con null explícito, cambiar mediaType reusando mediaUrl existente, PATCH vacío no llama update), remove (OK + 404). Mocks con QB stubbed para no necesitar DataSource real.
+- E2E (`exercises.e2e-spec.ts`, 34 cases): cubre los 5 endpoints, jerarquía OWNER/TRAINER/STUDENT (STUDENT lee pero no escribe), validaciones (URL inválida, DTO sin title, no-whitelisted, sin `x-tenant-slug`), media (mediaType=none + url → 400, video sin url → 400, video + url → 201, limpiar media en PATCH con null), filtros (q ILIKE, muscleGroups overlap, combinados con CSV), paginación, cross-tenant (404 sin filtrar existencia para GET/PATCH/DELETE), hard delete deja la fila fuera, 401 sin bearer.
+
+Archivos clave: `apps/api/src/modules/exercises/{exercises.module,exercises.controller,exercises.service,exercises.service.spec,exercises.repository}.ts`, `apps/api/src/modules/exercises/entities/exercise.entity.ts`, `apps/api/src/modules/exercises/dto/{create-exercise,update-exercise,list-exercises.query,exercise.response}.{dto,ts}`, `apps/api/src/migrations/1779280000000-InitExercises.ts`, `apps/api/src/app.module.ts` (import del módulo), `apps/api/test/exercises.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-022).
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 219/219 (198 previos del Step 13 + 21 nuevos en exercises-service). `pnpm --filter @rutinex/api test:e2e` 169/169 (135 previos + 34 nuevos en exercises.e2e-spec.ts).
+
+Notas:
+
+- El GIN sobre `muscle_groups` es lo que hace que el operador `&&` sea eficiente al crecer el catálogo. La sintaxis del query es `exercise.muscle_groups && (:mg)::text[]` (paréntesis + cast explícito) porque sin el cast Postgres no infiere el tipo del array binding y tira un error de operador.
+- El `created_by` FK es `RESTRICT` (no se puede hacer hard delete del user creador). En MVP los users sólo se soft-delete (toggle `isActive=false`), así que el constraint no se gatilla. Si más adelante el SUPERADMIN agrega hard delete de users, hay que migrar el FK a `SET NULL` + hacer `created_by` nullable.
+- El `@ValidateIf((_, value) => value !== null)` en `UpdateExerciseDto.mediaUrl` es lo que permite mandar `null` explícito (limpiar media) sin que `@IsUrl` lo rechace. La validación de URL aplica sólo cuando el valor es string.
+- Los E2E del cross-tenant verifican explícitamente que `GET/PATCH/DELETE /exercises/:id` con id de otro tenant devuelven `EXERCISE_NOT_FOUND` (no filtran existencia) — alineado con el patrón establecido en ADR-018/ADR-020.
+
 ## Próxima acción concreta
 
-Step 14 — CRUD: Exercises. Entity + migración (`tenant_id` NOT NULL, `media_type` enum, `muscle_groups text[]`, `created_by` FK→users). CRUD completo (OWNER/TRAINER crea/edita/borra, STUDENT solo lee). `GET /exercises` con búsqueda por título y filtro por `muscle_groups`. Validación de URL de media. Ver criterios completos en `docs/07-roadmap.md` → Step 14.
+Step 15 — Storage de media (R2). Cloudflare R2 para upload de gifs/videos/images de ejercicios. SDK S3-compatible, presigned URLs, contrato del frontend. Ver criterios completos en `docs/07-roadmap.md` → Step 15.
 
 ## Pendientes / deudas técnicas
 

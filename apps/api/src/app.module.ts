@@ -8,6 +8,7 @@ import { AppService } from './app.service';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { getDataSourceOptions } from './config/database';
 import { AuthModule } from './modules/auth/auth.module';
+import { ExercisesModule } from './modules/exercises/exercises.module';
 import { SuperadminModule } from './modules/superadmin/superadmin.module';
 import { TenantsModule } from './modules/tenants/tenants.module';
 import { UsersModule } from './modules/users/users.module';
@@ -22,6 +23,7 @@ import { UsersModule } from './modules/users/users.module';
     UsersModule,
     AuthModule,
     SuperadminModule,
+    ExercisesModule,
   ],
   controllers: [AppController],
   providers: [

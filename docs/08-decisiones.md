@@ -722,4 +722,55 @@ El método `create` que existía en `TenantsService` desde Step 4 se borró: el 
 
 ---
 
+## ADR-022 — CRUD exercises: catálogo per-tenant, hard delete, lectura para STUDENT, filtros con OR
+
+**Contexto**: el Step 14 expone `POST/GET/PATCH/DELETE /exercises` como primer CRUD que apoya el endpoint sobre `TenantScopedRepository` (después de `users`). El roadmap dejaba abiertas cuatro sub-decisiones que conviene clavar para que los Steps 16 (routines) y siguientes puedan referenciarlas en lugar de re-discutirlas.
+
+**Decisiones**:
+
+### 1. Hard delete (no soft) en MVP
+
+`DELETE /exercises/:id` ejecuta `DELETE FROM exercises WHERE tenant_id=$1 AND id=$2`. Sin `deleted_at`, sin toggle `is_active`. Por qué:
+
+- A diferencia de `users` (donde el soft delete preserva el histórico de quién creó qué + permite reactivación), un ejercicio "borrado" no es operativamente recuperable — si el OWNER quiere volver a tenerlo, lo crea de nuevo.
+- `routine_items` no existe todavía (Step 16). Cuando exista, agregará una FK a `exercises.id`; ese momento decide qué hacer con ejercicios referenciados (RESTRICT al borrar + UI que muestre "este ejercicio está usado en N rutinas — moverlas primero" vs. soft delete con un flag de "archivado"). Por ahora el caso no existe y agregar la columna ahora sería diseño para hipotético.
+- Si más adelante necesitamos auditar "qué ejercicios existieron y fueron borrados" (poco probable en MVP), se agrega `deleted_at` con migración explícita y el wrapper aplica el filtro automático.
+
+### 2. STUDENT puede leer el catálogo del tenant
+
+`GET /exercises` y `GET /exercises/:id` no llevan `@Roles(...)`. Por ADR-019, eso deja el endpoint abierto a cualquier user autenticado del tenant — incluido STUDENT. Razón: el STUDENT necesita ver la descripción, el video/gif y los muscle groups de cada ejercicio durante la ejecución de su sesión. No tenía sentido mantener un endpoint paralelo `/student/exercises/:id` con la misma forma. El catálogo es por tenant, así que el `TenantGuard` ya garantiza aislamiento — el STUDENT de A no ve nada de B.
+
+Las escrituras (POST/PATCH/DELETE) sí llevan `@Roles('OWNER','TRAINER')`.
+
+### 3. Filtro `muscleGroups` con semántica OR (overlap), no AND
+
+`GET /exercises?muscleGroups=chest,triceps` matchea exercises que tengan **al menos uno** de los grupos pedidos. Implementado con el operador `&&` (array overlap) de Postgres sobre el índice GIN `ix_exercises_muscle_groups`.
+
+Razón: el caso operativo del TRAINER armando una rutina es "mostrame todos los ejercicios que toquen pecho o tríceps" (para elegir). Un filtro AND ("ejercicios que toquen pecho **y** tríceps simultáneamente") es raro y, si aparece, el caller filtra del lado del cliente. El OR cubre 95% de los casos con la API más simple.
+
+Trade-off conocido: si el catálogo crece y los TRAINERS quieren AND, agregamos `?muscleGroupsMode=all|any` con default `any`. Sin breaking change.
+
+### 4. Validación `mediaType`↔`mediaUrl` en el service con `code` parseable
+
+La coherencia (`mediaType=none` ⇒ `mediaUrl=null` y viceversa) se valida en `ExercisesService.create/update` y tira `400 EXERCISE_MEDIA_INCONSISTENT`. No se intentó expresar con `@ValidateIf` en el DTO porque encadenar dos validaciones cruzadas sobre el mismo campo (`mediaUrl` requerido si `mediaType !== 'none'` + `mediaUrl` ausente si `mediaType === 'none'`) en class-validator se vuelve ilegible y el mensaje 400 termina siendo el de los decoradores de cadena (`@IsUrl`, `@IsEmpty`) en vez del semántico.
+
+El URL en sí sí se valida en el DTO (`@IsUrl({ require_protocol: true, protocols: ['http', 'https'] })` + `@MaxLength(1024)`) — eso es validación de formato puro y class-validator es la herramienta adecuada.
+
+### 5. Catálogo per-tenant, no global
+
+Cada tenant tiene su catálogo de exercises (FK `tenant_id NOT NULL`). El doc de dominio menciona "Fase 2: catálogo global compartido" como roadmap; en MVP no hay tabla `global_exercises` ni mecanismo de copy-on-write. Si más adelante queremos un catálogo curado por nosotros, las opciones serían: (a) sembrar exercises en cada tenant al crearlo, (b) tabla separada `global_exercises` + join, (c) `tenant_id` nullable + UNIQUE parcial por tenant. La decisión queda diferida.
+
+### 6. Códigos de error nuevos
+
+- **404 `EXERCISE_NOT_FOUND`**: `findOne`/`update`/`delete` cuando el id no existe en el tenant del JWT. Cross-tenant también devuelve 404 (no se filtra existencia, alineado con ADR-018/ADR-020).
+- **400 `EXERCISE_MEDIA_INCONSISTENT`**: combinación inválida entre `mediaType` y `mediaUrl` (ver sección 4).
+
+**Consecuencias**:
+
+- `ExercisesController` queda muy delgado (CRUD puro + `@Roles` en escrituras); el service centraliza la única assertion de negocio (coherencia de media). Patrón replicable para Steps 16/17.
+- El uso de `createQueryBuilder` en `list` para `q` (ILIKE) y `muscleGroups` (overlap) **no pasa** por las guardas de `TenantScopedRepository`. La convención (documentada en el comentario del repo) es que el primer `.where(...)` sea siempre el filtro de tenant. Si en el futuro alguien introduce un linter custom para QB, se cubre.
+- El `created_by` FK es `RESTRICT`: no se puede borrar (hard) un user que tenga exercises creados. Como los users de tenant tienen soft delete (`isActive=false`) y no hard delete real en MVP, esto no se gatilla. Si en el futuro el SUPERADMIN agrega un hard delete de users, hay que migrar el FK a `SET NULL` + hacer `created_by` nullable.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)
