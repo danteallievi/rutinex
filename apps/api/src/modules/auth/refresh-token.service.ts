@@ -170,6 +170,20 @@ export class RefreshTokenService {
     return result.affected ?? 0;
   }
 
+  /**
+   * Revoca todos los refresh tokens activos del tenant. Lo usa el panel
+   * SUPERADMIN cuando desactiva un tenant (`is_active: true → false`) para
+   * que las sesiones vivas dejen de poder refrescar sin esperar 15min al
+   * vencimiento del access JWT.
+   */
+  async revokeAllForTenant(tenantId: string): Promise<number> {
+    const result = await this.repo.update(
+      { tenantId, revokedAt: IsNull() },
+      { revokedAt: new Date() },
+    );
+    return result.affected ?? 0;
+  }
+
   private generateToken(): string {
     return randomBytes(REFRESH_TOKEN_BYTES).toString('base64url');
   }

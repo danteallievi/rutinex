@@ -1,22 +1,17 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 
-import { CreateTenantDto } from './dto/create-tenant.dto';
 import { Tenant } from './entities/tenant.entity';
 import { TenantsService } from './tenants.service';
 
 type MockRepo = {
   findOne: jest.Mock;
-  create: jest.Mock;
-  save: jest.Mock;
 };
 
 function makeMockRepo(): MockRepo {
   return {
     findOne: jest.fn(),
-    create: jest.fn(),
-    save: jest.fn(),
   };
 }
 
@@ -49,62 +44,6 @@ describe('TenantsService', () => {
     service = module.get<TenantsService>(TenantsService);
   });
 
-  describe('create', () => {
-    const dto: CreateTenantDto = {
-      slug: 'olimpo',
-      name: 'Gimnasio Olimpo',
-    };
-
-    it('crea un tenant cuando el slug está libre y no es reservado', async () => {
-      const built = makeTenant({ slug: dto.slug, name: dto.name });
-      repo.findOne.mockResolvedValueOnce(null);
-      repo.create.mockReturnValueOnce(built);
-      repo.save.mockResolvedValueOnce(built);
-
-      const result = await service.create(dto);
-
-      expect(repo.findOne).toHaveBeenCalledWith({ where: { slug: 'olimpo' } });
-      expect(repo.create).toHaveBeenCalledWith({
-        slug: 'olimpo',
-        name: 'Gimnasio Olimpo',
-        branding: {},
-      });
-      expect(repo.save).toHaveBeenCalledWith(built);
-      expect(result).toBe(built);
-    });
-
-    it('aplica el branding recibido al crear', async () => {
-      const branding = { primaryColor: '#FF0000' };
-      const built = makeTenant({ branding });
-      repo.findOne.mockResolvedValueOnce(null);
-      repo.create.mockReturnValueOnce(built);
-      repo.save.mockResolvedValueOnce(built);
-
-      await service.create({ ...dto, branding });
-
-      expect(repo.create).toHaveBeenCalledWith({
-        slug: 'olimpo',
-        name: 'Gimnasio Olimpo',
-        branding,
-      });
-    });
-
-    it('rechaza con ConflictException si el slug está reservado', async () => {
-      await expect(service.create({ ...dto, slug: 'admin' })).rejects.toThrow(
-        ConflictException,
-      );
-      expect(repo.findOne).not.toHaveBeenCalled();
-      expect(repo.save).not.toHaveBeenCalled();
-    });
-
-    it('rechaza con ConflictException si el slug ya existe', async () => {
-      repo.findOne.mockResolvedValueOnce(makeTenant({ slug: 'olimpo' }));
-
-      await expect(service.create(dto)).rejects.toThrow(ConflictException);
-      expect(repo.save).not.toHaveBeenCalled();
-    });
-  });
-
   describe('findBySlug', () => {
     it('devuelve el tenant cuando existe y está activo', async () => {
       const tenant = makeTenant();
@@ -126,6 +65,34 @@ describe('TenantsService', () => {
       await expect(service.findBySlug('olimpo')).rejects.toThrow(
         NotFoundException,
       );
+    });
+  });
+
+  describe('findBySlugIncludingInactive', () => {
+    it('devuelve el tenant incluso pausado', async () => {
+      const tenant = makeTenant({ isActive: false });
+      repo.findOne.mockResolvedValueOnce(tenant);
+      await expect(service.findBySlugIncludingInactive('olimpo')).resolves.toBe(
+        tenant,
+      );
+    });
+
+    it('devuelve null cuando no existe (sin tirar)', async () => {
+      repo.findOne.mockResolvedValueOnce(null);
+      await expect(
+        service.findBySlugIncludingInactive('fantasma'),
+      ).resolves.toBeNull();
+    });
+  });
+
+  describe('findByIdIncludingInactive', () => {
+    it('devuelve el tenant por id (incluso pausado)', async () => {
+      const tenant = makeTenant({ isActive: false });
+      repo.findOne.mockResolvedValueOnce(tenant);
+      await expect(service.findByIdIncludingInactive(tenant.id)).resolves.toBe(
+        tenant,
+      );
+      expect(repo.findOne).toHaveBeenCalledWith({ where: { id: tenant.id } });
     });
   });
 });

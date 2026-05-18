@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 12 completo. Próximo: Step 13 — Panel superadmin (backend): CRUD tenants + OWNER inicial.
-**Última actualización**: 2026-05-17 — Step 12 (CRUD users del tenant + ADR-020 jerarquía/scope/soft delete).
+**Paso actual**: Step 13 completo. Próximo: Step 14 — CRUD Exercises.
+**Última actualización**: 2026-05-18 — Step 13 (panel SUPERADMIN backend + ADR-021).
 
 ## Cambios de doc
 
@@ -567,9 +567,60 @@ Notas:
 - En el controller, los handlers que llevan `@Roles('OWNER')` (delete, reset) overridean a nivel handler la meta de clase `@Roles('OWNER','TRAINER')`. El `RolesGuard` usa `Reflector.getAllAndOverride([handler, class])`, así que handler-level gana — comportamiento confirmado en los E2E (TRAINER llamando DELETE/reset recibe `FORBIDDEN_ROLE`, no `FORBIDDEN_ROLE_HIERARCHY`).
 - `removeForActor` tiene un segundo check `target.id === actor.userId` que en MVP es inalcanzable (sólo OWNER llega por `@Roles('OWNER')`, y si OWNER se intenta borrar a sí mismo cae en el primer check `target.role === 'OWNER'`). Queda como defensa en profundidad para el día que el `@Roles` cambie.
 
+### Step 13 — Panel superadmin (backend): CRUD tenants + OWNER inicial (2026-05-18)
+
+`POST /tenants` se eliminó del módulo `tenants` (era público desde Step 4) y la creación quedó bajo `POST /superadmin/tenants` con `SuperadminGuard`. Nuevo `SuperadminTenantsModule` con un service que orquesta tenant + OWNER en una sola transacción, list con filtro `active`, PATCH para toggle/branding y reset de password del OWNER. Decisiones cristalizadas en **ADR-021** (transacción atómica + política con múltiples OWNERs + revocación inmediata de refresh tokens al pausar el tenant + nuevo `code` `OWNER_NOT_FOUND`).
+
+**Endpoints** (`apps/api/src/modules/superadmin/superadmin-tenants.controller.ts`, todos `@UseGuards(SuperadminGuard)`; el `JwtAuthGuard` global popula `req.user`):
+
+- `POST /superadmin/tenants` (`HttpStatus.CREATED`): body `{ slug, name, branding?, owner: { email, firstName, lastName } }`. Genera password con `PasswordService.generate()` + hash, y dentro de `DataSource.transaction(...)`: chequea slug libre (409 `SLUG_TAKEN`) → crea tenant (`is_active=true`) → crea user OWNER con `must_change_password=true`. Response `{ tenant: SuperadminTenantResponse, owner: UserResponse, ownerPassword: string }` — la pass se devuelve en plano UNA VEZ y no se persiste/loggea. 409 `SLUG_RESERVED` para slugs de la lista (chequeo fuera de la transacción para no abrir conexión innecesariamente). El DTO valida regex/longitud del slug + email del OWNER + presencia del objeto `owner` (vía `@IsObject` para que NestJS rechace con 400 cuando falta).
+- `GET /superadmin/tenants`: query `active=true|false|all` (default `all`) + `page`/`pageSize` (default 1/20, max 100). `findAndCount` directo del repo, mapeado a `SuperadminTenantResponse` (incluye `isActive` + timestamps, a diferencia del `GET /tenants/by-slug/:slug` público que oculta esos campos). Orden `createdAt DESC`.
+- `PATCH /superadmin/tenants/:id` (`ParseUUIDPipe`): body `{ isActive?, branding? }` (slug y name son inmutables en MVP). Si la transición es `isActive: true → false`, llama a `RefreshTokenService.revokeAllForTenant(id)` después del update para que todas las sesiones vivas del tenant dejen de poder refrescar. La reactivación (`false → true`) NO restaura los refresh viejos. 404 `TENANT_NOT_FOUND` si el id no existe.
+- `POST /superadmin/tenants/:id/reset-owner-password` (`HttpStatus.OK`): query opcional `?ownerId=<uuid>`. Sin `ownerId` → busca el OWNER del tenant con `order: { createdAt: 'ASC' }` (el inicial en MVP). Con `ownerId` → filtra por `(id, tenantId, role='OWNER')`. Genera nueva pass, hashea, persiste con `must_change_password=true`, revoca todos los refresh tokens del OWNER. 404 `OWNER_NOT_FOUND` si no hay OWNER en el tenant o el `ownerId` no resuelve; 404 `TENANT_NOT_FOUND` si el tenant no existe. Response `{ owner: UserResponse, ownerPassword: string }`.
+
+**Refactor colateral**: `RefreshTokenService` ahora exporta `revokeAllForTenant(tenantId)` además del `revokeAllForUser` previo. Patrón idéntico (`UPDATE refresh_tokens SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL`).
+
+**Eliminación de código viejo** (ADR-021.5):
+
+- `TenantsService.create()` y `CreateTenantDto` borrados (estaban sin caller después del move).
+- `TenantsController.create()` eliminado; el controller queda con sólo `GET /tenants/by-slug/:slug` y el `@Public()` movido al handler en vez de la clase.
+- `tenants.service.spec.ts` reescrito: 5 tests (los 3 de `findBySlug` previos + nuevos para `findBySlugIncludingInactive` y `findByIdIncludingInactive` que no estaban cubiertos a nivel unit).
+- `tenants.e2e-spec.ts` reescrito: queda con sólo los 3 tests de `GET /tenants/by-slug/:slug` (devuelve, 404 cuando no existe, 404 cuando pausado). Los antiguos POST se migraron al spec nuevo abajo.
+
+**DTOs y response shapes** (`apps/api/src/modules/superadmin/dto/`):
+
+- `CreateSuperadminTenantDto` y `CreateSuperadminTenantOwnerDto`: slug/name/branding del tenant + owner anidado (email + nombre/apellido). El owner usa `@IsObject` + `@ValidateNested` para forzar 400 cuando el body no lo incluye.
+- `UpdateSuperadminTenantDto`: `isActive?` + `branding?`, ambos opcionales.
+- `ListSuperadminTenantsQueryDto`: `active` (`'true'|'false'|'all'`, default `'all'`), `page`, `pageSize`.
+- `ResetOwnerPasswordQueryDto`: `ownerId?` (UUID).
+- `SuperadminTenantResponse` + `toSuperadminTenantResponse(tenant)`: serializa el tenant (incluye `isActive` + timestamps). `CreateSuperadminTenantResponse`, `PaginatedSuperadminTenantsResponse`, `ResetOwnerPasswordResponse`: shapes públicas reusables por el frontend (Step 28).
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- **404 `OWNER_NOT_FOUND`**: emitido por reset cuando no hay OWNER o `ownerId` no matchea.
+
+**Tests**:
+
+- Unit (`superadmin-tenants.service.spec.ts`, 16 casos sobre 4 métodos): create OK + branding + SLUG_RESERVED corta antes de DB + SLUG_TAKEN dentro de la transacción; list con `all`/`true`/`false`/paginación; update con transición a inactivo (revoca refresh) + a activo (no revoca) + branding-only + 404; resetOwnerPassword sin ownerId (orden ASC + revoca) + con ownerId + 404 TENANT/OWNER. Mocks de `DataSource.transaction` que pasan un manager con `getRepository(Entity)` redirigido a los mocks de Tenant/User.
+- E2E (`superadmin-tenants.e2e-spec.ts`, 18 casos): cubre los 4 endpoints, 401 sin Authorization, 403 NOT_SUPERADMIN con JWT de OWNER, flujo completo crear → loguear OWNER → change-password → re-login limpio, branding, 409 SLUG_RESERVED/SLUG_TAKEN, 400 sin owner / slug inválido, rollback al fallar el OWNER (no queda tenant huérfano), filtros de list, paginación, toggle inactive bloquea login + revoca refresh + tira TENANT_INACTIVE, reactivación, 404, ParseUUIDPipe, reset OWNER round-trip completo (pass vieja falla → nueva sirve → mustChangePassword=true → refresh revocado), `?ownerId` apunta al explícito, OWNER_NOT_FOUND con y sin `ownerId`, 403 NOT_SUPERADMIN con JWT de OWNER.
+
+**Wiring**:
+
+- `SuperadminModule` ahora importa `TenantsModule` (para registrar la entity en `TypeOrmModule.forFeature` raíz), aloja `SuperadminTenantsController` + `SuperadminTenantsService` además del `/superadmin/ping` previo. No importa `UsersModule` — el service usa `DataSource.getRepository(User)` directo para queries y transacciones cross-tenant.
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 198/198 (182 previos del Step 12 + 16 nuevos en superadmin-tenants-service). `pnpm --filter @rutinex/api test:e2e` 135/135 (117 previos + 18 nuevos en superadmin-tenants.e2e-spec.ts + ajuste del tenants.e2e que pasó de 11 a 3 cases — los POST se migraron).
+
+Archivos clave: `apps/api/src/modules/superadmin/{superadmin-tenants.controller,superadmin-tenants.service,superadmin-tenants.service.spec,superadmin.module}.ts`, `apps/api/src/modules/superadmin/dto/{create-superadmin-tenant,update-superadmin-tenant,list-superadmin-tenants.query,reset-owner-password.query,superadmin-tenant.response}.{dto,ts}`, `apps/api/src/modules/auth/refresh-token.service.ts` (`revokeAllForTenant`), `apps/api/src/modules/tenants/{tenants.controller,tenants.service,tenants.service.spec}.ts` (limpieza), `apps/api/src/modules/tenants/dto/create-tenant.dto.ts` (eliminado), `apps/api/test/{superadmin-tenants,tenants}.e2e-spec.ts`, `docs/04-auth.md`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-021).
+
+Notas:
+
+- `class-validator`'s `@ValidateNested()` por sí solo no rechaza si el campo está ausente — sólo dispara la validación cuando hay valor. Agregar `@IsObject({ message: 'owner is required...' })` antes del `@ValidateNested()` es lo que asegura el 400 cuando el body no trae `owner`. Aplicable a futuros DTOs con nested objects obligatorios.
+- El test E2E del rollback usa un email malformado (`'no-es-email'`) para gatillar el 400 del DTO recién después de que la transacción habría empezado. En la práctica el ValidationPipe global corta antes — el rollback "real" del flujo es defensivo: ningún path conocido lo dispara post-rebajar al DTO, pero la transacción está ahí para cualquier error inesperado de DB después del `INSERT` del tenant (constraint violation en `users`, conexión que muere, etc.).
+- `DataSource.transaction(...)` en TypeORM 0.3 toma un callback `(manager) => Promise<T>`. El service consume `manager.getRepository(Entity)` para los repos transaccionales. Los mocks del spec replican esa interfaz devolviendo los repos jest-mocked desde `getRepository`, lo que evita tener que stubear todo el `EntityManager` real.
+
 ## Próxima acción concreta
 
-Step 13 — Panel superadmin (backend): CRUD tenants + OWNER inicial. Mover `POST /tenants` a `POST /superadmin/tenants` con `SuperadminGuard`. Crear tenant + OWNER en una sola transacción (password generada una vez). `GET /superadmin/tenants` con filtro `?active=true|false|all`. `PATCH /superadmin/tenants/:id` para toggle `is_active` y editar branding. `POST /superadmin/tenants/:id/reset-owner-password`. Ver criterios completos en `docs/07-roadmap.md` → Step 13.
+Step 14 — CRUD: Exercises. Entity + migración (`tenant_id` NOT NULL, `media_type` enum, `muscle_groups text[]`, `created_by` FK→users). CRUD completo (OWNER/TRAINER crea/edita/borra, STUDENT solo lee). `GET /exercises` con búsqueda por título y filtro por `muscle_groups`. Validación de URL de media. Ver criterios completos en `docs/07-roadmap.md` → Step 14.
 
 ## Pendientes / deudas técnicas
 

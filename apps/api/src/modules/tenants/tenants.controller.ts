@@ -1,8 +1,7 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Controller, Get, Param } from '@nestjs/common';
 
 import { Public } from '../auth/public.decorator';
-import { CreateTenantDto } from './dto/create-tenant.dto';
-import { Tenant, TenantBranding } from './entities/tenant.entity';
+import { TenantBranding } from './entities/tenant.entity';
 import { TenantsService } from './tenants.service';
 
 interface PublicTenantView {
@@ -15,21 +14,19 @@ interface PublicTenantView {
 /**
  * Endpoints públicos del módulo Tenants.
  *
- * `POST /tenants` se mueve a `/superadmin/tenants` en Step 13. Hasta entonces
- * sigue público para que los tests E2E del Step 4 funcionen sin auth.
- * `GET /tenants/by-slug/:slug` queda público de forma permanente (lo consume
- * la página del tenant para resolver el branding antes del login).
+ * `GET /tenants/by-slug/:slug` lo consume la página del tenant en la web
+ * para resolver branding antes de cualquier login. Devuelve sólo lo público:
+ * sin `is_active`, sin timestamps. Si el tenant no existe o está pausado,
+ * devuelve 404 `TENANT_NOT_FOUND` (no se filtra existencia).
+ *
+ * El alta de tenants vive en `POST /superadmin/tenants` desde el Step 13
+ * (sales-led, ver ADR-012). Acá no hay endpoint de creación.
  */
 @Controller('tenants')
-@Public()
 export class TenantsController {
   constructor(private readonly tenantsService: TenantsService) {}
 
-  @Post()
-  create(@Body() dto: CreateTenantDto): Promise<Tenant> {
-    return this.tenantsService.create(dto);
-  }
-
+  @Public()
   @Get('by-slug/:slug')
   async findBySlug(@Param('slug') slug: string): Promise<PublicTenantView> {
     const tenant = await this.tenantsService.findBySlug(slug);

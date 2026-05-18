@@ -676,4 +676,50 @@ Razón de no extraer `PasswordModule` / `RefreshTokenModule`: cero ganancia arqu
 
 ---
 
+## ADR-021 — Panel SUPERADMIN: transacción atómica + política de múltiples OWNERs
+
+**Contexto**: el Step 13 expone los endpoints del panel SUPERADMIN sobre `/superadmin/tenants/*`. Hay tres sub-decisiones que no caben en los criterios del roadmap y conviene clavar antes de empezar el frontend (Step 28) para que el contrato del API no rote.
+
+**Decisiones**:
+
+### 1. `POST /superadmin/tenants` corre tenant + OWNER en una sola transacción
+
+`SuperadminTenantsService.create()` envuelve la creación del tenant y la del OWNER inicial en una sola `DataSource.transaction(...)`. Si cualquier paso falla (DTO inválido del owner cuando ya estaba creado el tenant, colisión de slug, error de DB), el rollback completo deja el sistema sin filas huérfanas.
+
+La password en plano se genera y hashea **fuera** de la transacción para no extender el tiempo de lock con la espera del Argon2 (decenas de ms). El plano vive sólo en la variable local del handler + la response — no se persiste ni se loggea (ADR-013 ya lo dejaba dicho para alta de OWNERs/TRAINERs, acá lo confirmamos para esta superficie).
+
+### 2. Política con múltiples OWNERs: default "primero por createdAt", override con `?ownerId`
+
+En MVP cada tenant se crea con exactamente un OWNER vía `POST /superadmin/tenants`, así que `POST /superadmin/tenants/:id/reset-owner-password` puede resolver el OWNER de forma única por default. Pero la tabla `users` permite múltiples OWNERs en el mismo tenant (el constraint compuesto sólo prohíbe `(tenant_id, email)` duplicado), así que el endpoint tiene que tener un comportamiento definido para ese caso.
+
+- Sin `?ownerId`: el endpoint elige **el primero por `createdAt ASC`** (en MVP siempre es el OWNER inicial creado en `POST /superadmin/tenants`).
+- Con `?ownerId=<uuid>`: filtra por `(id, tenantId, role='OWNER')` y resetea ese OWNER específico. Si no resuelve → 404 `OWNER_NOT_FOUND`.
+
+Por qué no "resetear todos" o "rechazar si hay varios": el caso operativo real del reset es "el OWNER perdió/quiere rotar su pass" — resetear de a uno es lo natural. Si en algún momento un tenant termina con dos OWNERs (futuro: alta de OWNER secundario desde el panel del tenant) y el SUPERADMIN no sabe a cuál apuntar, el frontend del Step 28 puede listar los OWNERs y mostrar un selector — la query `?ownerId` está pensada para eso.
+
+### 3. Toggle `is_active=false` revoca refresh tokens del tenant (efecto inmediato)
+
+`PATCH /superadmin/tenants/:id` con `isActive: false` (y la fila estaba previamente activa) llama a `RefreshTokenService.revokeAllForTenant(tenantId)` antes de devolver la response. Sin esto, las sesiones vivas de los users del tenant seguirían rotando refresh tokens durante 30 días aunque el login esté bloqueado por `TENANT_INACTIVE`.
+
+El access JWT vivo (≤15min) sigue funcionando — no hay blacklist activa — pero `/auth/refresh` ya rechaza con 401 genérico al validar que el tenant esté activo (Step 9). El "límite" efectivo es esos 15min. Aceptable para MVP: si se necesita corte inmediato (caso de abuso), el SUPERADMIN puede combinarlo con otras acciones (revocar al OWNER también, por ejemplo).
+
+Reactivar el tenant (`isActive: false → true`) **no** restaura los refresh tokens revocados — son inválidos para siempre. Los users tienen que hacer login de cero. Esto es deliberado: si los tokens viejos volvieran a valer después de un período de pausa, alguien que se llevó un refresh durante la ventana pausada podría seguir entrando al reactivar.
+
+### 4. Código de error nuevo
+
+- **404 `OWNER_NOT_FOUND`**: emitido por `SuperadminTenantsService.resetOwnerPassword(...)` cuando el tenant no tiene OWNER o cuando `?ownerId` no resuelve. Separado de `USER_NOT_FOUND` para que el frontend del Step 28 pueda mostrar un mensaje específico ("este tenant quedó sin OWNER — caso anómalo, hablar con DBA"). El 404 `TENANT_NOT_FOUND` se mantiene para "el id del tenant no existe".
+
+### 5. `TenantsService.create()` se elimina del módulo `tenants`
+
+El método `create` que existía en `TenantsService` desde Step 4 se borró: el endpoint `POST /tenants` se movió a `POST /superadmin/tenants` (que vive en el módulo `superadmin` y arma el tenant + OWNER en transacción). El service de `tenants` queda con sólo lecturas (`findBySlug`, `findBySlugIncludingInactive`, `findByIdIncludingInactive`). Borrarlo evita duplicación de lógica de slug validation (que sigue viviendo en `tenants/slug.ts` + en el DTO + en `SuperadminTenantsService.create`).
+
+**Consecuencias**:
+
+- El surface SUPERADMIN queda completamente operativo end-to-end vía API: el operador puede crear tenants + OWNERs, listarlos con filtros, pausar/reactivar, resetear password del OWNER. El frontend del Step 28 traduce todo esto a UX (form + modal de "copiá la password una vez" + tabla con toggle).
+- Si en el futuro aparece un caso de "delete real" (borrar el tenant + cascade de todo), se agrega `DELETE /superadmin/tenants/:id`. Hoy `is_active=false` es suficiente; el delete real implica decidir qué hacer con sets/sesiones históricas (auditoría legal, etc.) — diferido.
+- El endpoint de reset password de OWNER no acepta SUPERADMINs como target — la fila SUPERADMIN tiene `tenant_id IS NULL` y `role IS NULL`, así que el filtro `(tenantId, role='OWNER')` la excluye naturalmente. Si más adelante hace falta resetear la password de otro SUPERADMIN, va por un endpoint separado (`POST /superadmin/users/:id/reset-password` o similar).
+- **Riesgo**: la decisión "primero por createdAt" pierde determinismo si por DBA-fix alguien tocara `createdAt` a mano. Improbable, pero `?ownerId` está como escape hatch determinístico.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

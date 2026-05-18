@@ -12,16 +12,17 @@
 
 ## Endpoints
 
-| Endpoint                         | Auth       | Descripción                                                                                                                                                                    |
-| -------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST /auth/login`               | -          | Email + password. Slug viene del subdominio (`x-tenant-slug` o host `superadmin`). Devuelve access + refresh.                                                                  |
-| `POST /auth/student-login`       | -          | DNI. Slug viene del subdominio. Solo para STUDENTS. Devuelve access + refresh.                                                                                                 |
-| `POST /auth/refresh`             | -          | Refresh token. Rota el refresh y devuelve par nuevo.                                                                                                                           |
-| `POST /auth/logout`              | bearer     | Revoca el refresh token actual.                                                                                                                                                |
-| `POST /auth/logout-all`          | bearer     | Revoca todos los refresh del usuario.                                                                                                                                          |
-| `POST /auth/change-password`     | bearer     | Forzado (`must_change_password=true`): solo `newPassword`. Voluntario: `currentPassword` + `newPassword`.                                                                      |
-| `POST /superadmin/tenants`       | superadmin | Crea tenant + OWNER inicial en una transacción. Devuelve password del OWNER **una vez**.                                                                                       |
-| `POST /users/:id/reset-password` | bearer     | OWNER puede resetear password de TRAINER del mismo tenant; SUPERADMIN puede resetear password de OWNER. Genera nueva, devuelve **una vez**, setea `must_change_password=true`. |
+| Endpoint                                            | Auth       | Descripción                                                                                                                                                |
+| --------------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /auth/login`                                  | -          | Email + password. Slug viene del subdominio (`x-tenant-slug` o host `superadmin`). Devuelve access + refresh.                                              |
+| `POST /auth/student-login`                          | -          | DNI. Slug viene del subdominio. Solo para STUDENTS. Devuelve access + refresh.                                                                             |
+| `POST /auth/refresh`                                | -          | Refresh token. Rota el refresh y devuelve par nuevo.                                                                                                       |
+| `POST /auth/logout`                                 | bearer     | Revoca el refresh token actual.                                                                                                                            |
+| `POST /auth/logout-all`                             | bearer     | Revoca todos los refresh del usuario.                                                                                                                      |
+| `POST /auth/change-password`                        | bearer     | Forzado (`must_change_password=true`): solo `newPassword`. Voluntario: `currentPassword` + `newPassword`.                                                  |
+| `POST /superadmin/tenants`                          | superadmin | Crea tenant + OWNER inicial en una transacción. Devuelve password del OWNER **una vez**.                                                                   |
+| `POST /users/:id/reset-password`                    | bearer     | OWNER puede resetear password de TRAINER del mismo tenant. Genera nueva, devuelve **una vez**, setea `must_change_password=true`.                          |
+| `POST /superadmin/tenants/:id/reset-owner-password` | superadmin | Resetea password del OWNER del tenant (con `?ownerId` opcional para apuntar a uno específico cuando hay varios — ADR-021). Mismo modelo de "una sola vez". |
 
 > **Eliminado del MVP**: `POST /auth/signup` (no hay onboarding self-service), `POST /auth/password-reset` y `POST /auth/password-reset/confirm` (no hay flujo de "olvidé mi password" por email — el reset lo hace el OWNER o el SUPERADMIN). Si el modelo vuelve a PLG en el futuro, ver ADR-012.
 
@@ -186,8 +187,9 @@ Mismo endpoint, dos modos según `users.must_change_password`. La fortaleza mín
 
 - `POST /users/:id/reset-password` (auth bearer):
   - **OWNER**: solo puede resetear la password de un TRAINER del mismo tenant.
-  - **SUPERADMIN**: solo puede resetear la password de un OWNER (en `/superadmin/users/:id/reset-password` o en el mismo endpoint con autorización por jerarquía — a decidir en el step correspondiente).
   - **TRAINER**: no puede resetear nada (los STUDENTS no tienen password).
+- `POST /superadmin/tenants/:id/reset-owner-password` (Step 13, auth bearer SUPERADMIN, ADR-021):
+  - Resetea la password del OWNER del tenant indicado. Si hay múltiples OWNERs, default-ea al primero por `createdAt ASC`; con `?ownerId=<uuid>` apunta a uno específico. 404 `OWNER_NOT_FOUND` si el tenant no tiene OWNER o el `ownerId` no resuelve.
 - Genera nueva password con la política de arriba, la devuelve **una vez** en la response, setea `must_change_password=true` y revoca todos los refresh tokens del user reseteado.
 
 ## Auth del SUPERADMIN
