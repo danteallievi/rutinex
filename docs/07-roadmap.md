@@ -537,7 +537,17 @@ Sin numerar todavía. Cuando alguna de estas se priorice, se vuelve un step nume
 - Audit log de acciones del SUPERADMIN (crear tenant, reset password, toggle `is_active`, edit branding).
 - Rate limiting más agresivo en `superadmin.rutinex.app/login`.
 - Self-service signup si el modelo vuelve a PLG (reactivar `/auth/signup`, formulario en landing, validación de slug en signup, email de confirmación).
-- Toggle dark/light theme. Hoy todo el frontend asume dark fijo (las CSS vars de `apps/web/app/globals.css` están definidas en `:root`, sin variante light). Cuando se priorice: agregar palette light, mover las vars a un selector tipo `[data-theme="light"]`, persistir la preferencia (cookie/localStorage), respetar `prefers-color-scheme` como default, y exponer un toggle en el header de cada surface (landing, admin, student, superadmin). Decidir si el branding por tenant también tiene variantes light/dark del `primaryColor` o si se reutiliza el mismo.
+- **Refactor visual: design tokens en 3 capas + swap tipográfico + toggle dark/light** (ver ADR-016 y `docs/06-frontend-conventions.md` sección "Theming y branding"). Hoy todas las CSS vars viven planas en `:root` con names mezclados (`--brand-*` + alias shadcn) y las fuentes son Geist/Geist Mono heredadas de `create-next-app`. Cuando se priorice este paquete, hacer todo en un solo step para no entreverar tres refactors visuales:
+  1. Partir `app/globals.css` en `app/styles/tokens.css` (capa 1 brand + capa 2 semantic + capa 3 component, todo declarado explícitamente) + el resto de `globals.css` (resets, base layer, `@theme inline` mapeando solo capa 2/3).
+  2. Renombrar las vars existentes a la nomenclatura semántica (`--brand-primary` → `--color-accent`, etc.) y dejar capa 3 como alias para shadcn. Componentes que ya usan utilities (`bg-card`, `text-foreground`) no cambian; solo cambia el origen de las vars.
+  3. `lib/theme.ts` con `tenantThemeVars(branding)` que devuelve el set chico de vars overridables por el tenant (hoy `--color-accent` + `--color-accent-fg` + `--ring`). Reemplaza el inline ad hoc del Step 4.5 en `app/t/[slug]/page.tsx` y se usa también desde el wrapper de admin/student.
+  4. Swap tipográfico: Geist → **Montserrat** (sans/heading) y Geist Mono → **JetBrains Mono** (mono), cargadas con `next/font/google` en `app/layout.tsx`. Vars expuestas: `--font-sans`, `--font-heading`, `--font-mono`. Borrar referencias a `--font-geist-*`.
+  5. Variante light: duplicar bindings de capa 2 bajo `[data-theme="light"]` con paleta invertida (capa 1 no se duplica). Definir el contraste de los acentos light por tenant (función derivadora en `lib/theme.ts`).
+  6. Toggle en el header de cada surface (landing, admin, student, superadmin). Default: `prefers-color-scheme`. Persistencia: cookie httpOnly `SameSite=Lax` leída en el server layout para evitar flash de tema incorrecto en SSR.
+  7. Smoke visual: las 9 rutas del Step 7.5 (landing, /superadmin/tenants, /t/[slug], /t/[slug]/admin, /t/[slug]/admin/students, /t/[slug]/admin/students/[id], /t/[slug]/student, /t/[slug]/student/exercises/[id]) renderean igual en dark, se ven coherentes en light, y un tenant con `primaryColor` distinto no rompe ningún contraste.
+
+  Criterio: rebrand hipotético (cambiar el naranja por verde) implica reemplazar solo la escala `--rutinex-orange-*` por `--rutinex-green-*` en `tokens.css` y reasignar `--color-accent` a la nueva escala; nada más se toca. Toggle funcional en las 4 surfaces.
+
 - Invitación de alumno por email/WhatsApp con link mágico.
 - Comentarios visibles al trainer + notifs.
 - PWA (manifest + service worker, install prompt).

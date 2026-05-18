@@ -375,4 +375,92 @@ Lock de versiones mayores. Se sube major solo con justificación explícita en A
 
 ---
 
+## ADR-016 — Sistema de design tokens (3 capas) + stack tipográfico
+
+**Contexto**: hoy `apps/web/app/globals.css` mete todos los colores en `:root` sin separar qué es brand, qué es semántica, qué es shadcn y qué overridea el tenant. El theme es dark fijo (no hay variante light), el `primaryColor` del tenant se inyecta como CSS var ad hoc en `app/t/[slug]/page.tsx`, y los hexa naranjas (`#f97316`) están repetidos hardcodeados en `--brand-primary`, `--primary`, `--ring`, `--sidebar-primary`, `--sidebar-ring` y en cada `--chart-*`. Mientras todo viva en `:root` y sin capas:
+
+- Soportar light/dark implica duplicar 20+ vars en dos `:root`, con riesgo alto de drift.
+- Rebrandear (cambiar el naranja por otro color, o el dark por una paleta marrón/sépia) implica buscar y reemplazar valores en N lugares.
+- Cuando se quiera permitir que un tenant overridee más que el `primaryColor` (ej. accent secundario, color de fondo del student surface), no hay un punto único donde inyectar esas vars sin pisar el theme global.
+
+El stack tipográfico tiene un drift menor pero del mismo tipo: `--font-geist-sans` y `--font-geist-mono` están hardcoded en `app/layout.tsx` con `next/font/google` y en `@theme inline` como `--font-sans`/`--font-mono`/`--font-heading`. El proyecto se va a alejar de Geist (preferencia del dueño por Montserrat para sans, JetBrains Mono encaja mejor con la estética editorial-precision del Step 7.5 — uppercase mono labels + `tabular-nums` para sets/reps/PRs — que Geist Mono). Hacer ese swap sin un sistema deja los nombres `--font-geist-*` regados por el código.
+
+Este ADR define la arquitectura **antes** de implementar dark/light (Fase 4) para que cuando entre la implementación sea mecánica, y para que un futuro rebranding (cambiar la paleta entera) sea un cambio puntual en una capa.
+
+**Opciones**:
+
+- **A. Mantener el modelo actual** (una capa de vars en `:root`). Para light/dark, duplicar todas las vars bajo `[data-theme="light"]` y mantener las dos copias en paralelo.
+- **B. Dos capas — semantic + component** (estilo shadcn defaults). `--primary`, `--background`, etc. resuelven contra valores hardcoded; el theme switch reasigna esas vars. Mejora algo, pero un rebrand sigue obligando a tocar cada definición.
+- **C. Tres capas + tenant overlay**. **Capa 1 — Brand tokens** (paleta cruda, valores hex): `--rutinex-orange-50..950`, `--rutinex-neutral-50..950`, etc. **Capa 2 — Semantic tokens** (intención, theme-aware): `--color-bg`, `--color-fg`, `--color-accent`, `--color-danger`, etc., que resuelven a brand tokens y cambian de binding en `[data-theme="light"]` vs `[data-theme="dark"]`. **Capa 3 — Component tokens** (las vars que consume shadcn y nuestro CSS): `--card`, `--popover`, `--primary`, etc., que resuelven a semantic tokens. **Tenant overlay**: el tenant solo overridea un set chico de vars (hoy `--color-accent`, mañana quizá `--color-accent-fg` derivado), inyectadas como inline `style` en el wrapper del prefix `/t/[slug]`, sin tocar el resto.
+
+**Decisión**: **C — tres capas + tenant overlay**.
+
+Misma decisión para fuentes, en escala menor: una sola fuente de verdad nombrada por rol (`--font-sans`, `--font-mono`, `--font-heading`) que resuelve a la implementación cargada en `app/layout.tsx`. Si mañana se cambia Montserrat por otra, se cambia en `layout.tsx` y la definición de la var; nada del resto del código se toca.
+
+Decisión concreta del stack tipográfico inicial:
+
+- **Sans (UI, body, headings)**: **Montserrat** vía `next/font/google`, weights `400/500/600/700/800`. Variable CSS expuesta como `--font-sans` (y `--font-heading` apunta a la misma). Razón: preferencia del dueño + buena cobertura de pesos para la jerarquía editorial del Step 7.5, soporte completo de glifos Latin, license abierta (SIL OFL), hosting first-party via next/font.
+- **Monospace (números, labels mono uppercase, código)**: **JetBrains Mono** vía `next/font/google`, weights `400/500/600/700`. Variable CSS expuesta como `--font-mono`. Razón: las dos surfaces (admin y student) usan números tabulares y labels mono uppercase pesadamente; JetBrains Mono está pensado específicamente para ese uso, sus tab/digit metrics son consistentes, y combina visualmente bien con Montserrat.
+- **Serif**: no se carga por default. Si en el futuro aparece un acento editorial (titular de marketing en `/`, citas de testimonios), se evalúa en ese momento. Candidatos pre-aprobados: **Fraunces** o **Instrument Serif** (ambos vía `next/font/google`).
+
+**Razón**:
+
+- La separación brand → semantic → component es el patrón estándar de design systems (Tailwind v4, Material 3, Radix Themes). Permite **rebrand** (tocar capa 1) y **theme switch** (tocar capa 2) de forma independiente.
+- Las vars semánticas tienen nombres que describen **intención** (`--color-bg`, `--color-fg-muted`), no apariencia (`--gray-900`). Eso evita comentarios del tipo "esto es gris en dark pero queda raro en light".
+- El tenant overlay queda acotado por diseño a un set chico de vars (capa 2 / 3 específicas) inyectadas vía `style` inline en un wrapper, no como mutación de `:root`. Eso impide que un tenant rompa la legibilidad del surface eligiendo un `primaryColor` con contraste pésimo: solo afecta lo que decidimos exponer. Si un tenant pasa un color sin la versión "foreground" derivada, calculamos un `--color-accent-fg` en server-side con `wcag-contrast` o similar.
+- Diferir el ADR hasta el momento de implementar dark/light obliga a refactorizar el código existente (rebautizar `--brand-primary` → `--color-accent`, mover vars de `:root` a una jerarquía, etc.) **dentro del step de la feature**, mezclando refactor con feature. Codificar la arquitectura **antes** vuelve a la implementación una traducción mecánica del ADR.
+- El stack de fuentes deja `Geist`/`Geist Mono` (defaults heredados de `create-next-app` en Step 1) por algo elegido a propósito, alineado con la estética editorial-precision ya consolidada en Step 7.5.
+
+**Consecuencias**:
+
+- Se introduce **`app/styles/tokens.css`** (importado desde `app/globals.css`) con las tres capas explícitas:
+  ```css
+  /* capa 1 — brand (paleta cruda, estática) */
+  :root {
+    --rutinex-orange-500: #f97316;
+    --rutinex-orange-400: #fb923c;
+    /* ... toda la escala */
+    --rutinex-neutral-50: #fafafa;
+    --rutinex-neutral-950: #0a0a0a;
+    /* ... */
+  }
+  /* capa 2 — semantic (intención, theme-aware) */
+  :root,
+  [data-theme='dark'] {
+    --color-bg: var(--rutinex-neutral-950);
+    --color-bg-elevated: var(--rutinex-neutral-900);
+    --color-fg: var(--rutinex-neutral-50);
+    --color-fg-muted: var(--rutinex-neutral-400);
+    --color-border: var(--rutinex-neutral-800);
+    --color-accent: var(--rutinex-orange-500);
+    --color-accent-fg: var(--rutinex-neutral-950);
+    --color-danger: /* ... */;
+    /* ... */
+  }
+  [data-theme='light'] {
+    --color-bg: var(--rutinex-neutral-50);
+    --color-fg: var(--rutinex-neutral-950);
+    /* ... bindings invertidos */
+  }
+  /* capa 3 — component (alias para shadcn + utilities) */
+  :root {
+    --background: var(--color-bg);
+    --foreground: var(--color-fg);
+    --card: var(--color-bg-elevated);
+    --primary: var(--color-accent);
+    --ring: var(--color-accent);
+    /* ... */
+  }
+  ```
+- **Regla**: el código nunca importa de capa 1 directo (`bg-rutinex-orange-500` está prohibido fuera de `tokens.css`). Componentes consumen capa 2 (`bg-[var(--color-accent)]`) o capa 3 vía utilities (`bg-primary`). Tailwind 4 las expone via `@theme inline` mapeando solo capa 2/3.
+- **Tenant overlay**: el wrapper `<main>` de `app/t/[slug]/...` setea inline solo `--color-accent` (y derivados como `--color-accent-fg`, `--ring`) desde `tenant.branding`. El resto del theme queda intacto. Si más adelante se quiere overridear más, se amplía la lista de vars overridable en un solo lugar (la función `tenantThemeVars(branding)` en `lib/theme.ts`).
+- **Dark/Light**: el toggle setea `[data-theme="light"]` en `<html>`. Default: respetar `prefers-color-scheme`; persistir la preferencia en cookie httpOnly (SameSite=Lax) leída en el server para evitar el flash de tema incorrecto en SSR. Detalle de implementación en el step correspondiente.
+- **Fuentes**: `app/layout.tsx` carga Montserrat + JetBrains Mono via `next/font/google` y expone `--font-sans` / `--font-mono` / `--font-heading`. Las antiguas `--font-geist-*` se eliminan. `globals.css` reemplaza referencias en `@theme inline` y `font-family` del `body`.
+- **Migración**: el step de implementación (Fase 4) hace el refactor mecánico — rebautizar las vars existentes, partir `globals.css` en `tokens.css` + el resto, ajustar `tailwind.config`-equivalente en `@theme inline`, y cargar las fuentes nuevas. No requiere tocar componentes que ya usan utilities (`bg-card`, `text-foreground`, etc.) — esas siguen funcionando porque la capa 3 conserva los mismos nombres.
+- **Rebrand futuro**: cambiar el naranja por (digamos) verde implica reemplazar la escala `--rutinex-orange-*` por `--rutinex-green-*` en `tokens.css` y reasignar `--color-accent` a la nueva escala. Todo lo demás sigue funcionando.
+- **Riesgo**: si capa 1 y capa 2 se mezclan por error (alguien define `--color-accent: #f97316` saltándose la paleta), el rebrand vuelve a ser doloroso. Mitigación: el step de implementación deja un comentario claro en `tokens.css` y, opcional, un test de regresión que parsea el CSS y verifica que ningún token de capa 2 resuelve a un hex directo.
+- **Riesgo de fuentes**: cargar dos familias completas con varios weights agrega payload. Mitigación: `next/font/google` con `display: 'swap'`, `subsets: ['latin']`, y limitar weights a los efectivamente usados (lista arriba). Si el LCP sufre, evaluar bajar Montserrat a `400/600/700` y cubrir el resto con fallbacks del sistema (ya está en el stack: `system-ui, sans-serif`).
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

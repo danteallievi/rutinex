@@ -191,23 +191,72 @@ El modo **voluntario** del mismo endpoint (`{ currentPassword, newPassword }`) s
 
 ## Theming y branding
 
-- Tailwind 4 con CSS variables. La paleta se declara en `app/globals.css` dentro de `:root` + `@theme inline` (no hay `tailwind.config.ts`; Tailwind 4 lee el theme desde el CSS).
-- Defaults globales: `--brand-primary`, `--brand-accent`, etc., bajo el theme de Rutinex.
-- En la página del tenant (`app/t/[slug]/page.tsx`) se hace fetch del tenant y se setean las CSS vars **scope local** vía `style` en el `<main>`:
+Tailwind 4 con CSS variables; no hay `tailwind.config.ts` (Tailwind 4 lee el theme desde el CSS vía `@theme inline`). La paleta se organiza en **tres capas** + un **tenant overlay** acotado. La arquitectura está fijada en **ADR-016**; esta sección es la guía operativa.
 
-  ```tsx
-  const cssVars = {
-    '--brand-primary': tenant.branding.primaryColor ?? defaultPrimary,
-    '--brand-accent': tenant.branding.accentColor ?? defaultAccent,
-  } as React.CSSProperties;
+### Las tres capas
 
-  return <main style={cssVars}>{...}</main>;
-  ```
+1. **Brand tokens** (capa 1) — paleta cruda, valores hex/oklch, **estáticos**. Viven en `app/styles/tokens.css`. Nombres tipo `--rutinex-orange-500`, `--rutinex-neutral-50..950`. Si mañana cambia el branding (naranja → verde, dark frío → dark cálido), **solo se toca esta capa**.
 
-- Las utilities Tailwind correspondientes (`bg-brand-primary`, `text-brand-primary`, etc.) se resuelven contra esas vars. Para tonos custom que dependen del color del tenant (badges, bordes con alpha), se usa `style` inline con el valor crudo (`primary`) — Tailwind no genera utilities dinámicas.
-- Las superficies admin y marketing usan el theme fijo de Rutinex (sin override).
+   > Prohibido consumirlos directo desde componentes (`bg-rutinex-orange-500` es un anti-patrón). Si te tienta, lo que querés está en capa 2.
 
-> Hoy el theme es **dark fijo**: las CSS vars de `app/globals.css` viven en `:root` sin variante light. El toggle dark/light queda diferido a Fase 4 (ver `docs/07-roadmap.md`); cuando entre, las vars se reorganizan en `[data-theme="..."]` y se respeta `prefers-color-scheme`. Mientras tanto, no asumas light en ningún componente: contrastes y colores se diseñan contra el fondo oscuro.
+2. **Semantic tokens** (capa 2) — intención + theme-aware. Nombres tipo `--color-bg`, `--color-bg-elevated`, `--color-fg`, `--color-fg-muted`, `--color-border`, `--color-accent`, `--color-accent-fg`, `--color-danger`, `--color-success`, `--color-warning`. Resuelven a brand tokens y **cambian binding** según `[data-theme="dark"]` vs `[data-theme="light"]`. Es la API pública para nuestro código.
+
+3. **Component tokens** (capa 3) — alias de compatibilidad con shadcn y utilities Tailwind. Nombres tipo `--background`, `--foreground`, `--card`, `--primary`, `--ring`, `--popover`. Resuelven a capa 2. Existen para no reescribir los componentes shadcn generados y para que `bg-primary`, `text-foreground`, etc. sigan funcionando.
+
+```
+componente Tailwind / shadcn
+        │  bg-primary / text-foreground / border
+        ▼
+capa 3 — component tokens (--primary, --background, --card, ...)
+        ▼
+capa 2 — semantic tokens (--color-accent, --color-bg, --color-fg, ...)
+        ▼
+capa 1 — brand tokens (--rutinex-orange-500, --rutinex-neutral-950, ...)
+```
+
+### Regla mental rápida
+
+- ¿Estás escribiendo un componente? → consumí **capa 3** (vía utilities Tailwind: `bg-card`, `text-muted-foreground`, etc.) o **capa 2** (`bg-[var(--color-bg-elevated)]`) cuando no haya utility.
+- ¿Estás definiendo una variante o estado nuevo en `tokens.css`? → resolvé hacia **capa 2 o 1**, nunca a un hex pelado.
+- ¿Querés un color del branding del tenant en un componente? → usá `--color-accent` (no `--brand-primary` viejo, no el hex inline).
+
+### Dark/Light
+
+- El theme actual es **dark**. La variante **light** entra en Fase 4 (ver roadmap). Cuando entre, las vars semánticas de capa 2 se duplican en `[data-theme="light"]` con bindings invertidos; capa 1 y capa 3 no cambian.
+- Default: respetar `prefers-color-scheme`.
+- Persistencia: cookie httpOnly (`SameSite=Lax`) leída en el server para evitar flash de tema incorrecto en SSR.
+- Toggle disponible en el header de cada surface (landing, admin, student, superadmin).
+- Hasta que entre la feature: **no asumas light en ningún componente**. Contrastes y colores se diseñan contra el fondo oscuro.
+
+### Tenant overlay (branding)
+
+El branding por tenant **no muta el theme global**. Solo se overridea un set chico de vars de capa 2 vía `style` inline en el wrapper del prefix `/t/[slug]`:
+
+```tsx
+import { tenantThemeVars } from '@/lib/theme';
+
+const cssVars = tenantThemeVars(tenant.branding); // { '--color-accent': ..., '--color-accent-fg': ..., '--ring': ... }
+return <main style={cssVars}>{...}</main>;
+```
+
+- Hoy: el tenant overridea `--color-accent` (y `--color-accent-fg` derivado por contraste cuando el branding no lo pasa explícito).
+- A futuro: si querés permitir más overrides, sumalos a `tenantThemeVars(branding)` en `lib/theme.ts` — **un solo lugar**.
+- Las surfaces que **no son del tenant** (landing comercial, surface `(superadmin)`) usan el theme de Rutinex sin override.
+- Tailwind utilities dinámicas que dependen del color del tenant (badges con alpha, bordes derivados) van vía `style` inline con `color-mix(in srgb, var(--color-accent) ...)` — Tailwind no genera utilities dinámicas.
+
+### Fuentes
+
+Stack tipográfico definido en ADR-016:
+
+- **Sans (UI, body, headings)**: **Montserrat**, weights `400/500/600/700/800`. Expuesta como `--font-sans` y `--font-heading` (apuntan a la misma).
+- **Mono (números tabulares, labels mono uppercase, código)**: **JetBrains Mono**, weights `400/500/600/700`. Expuesta como `--font-mono`.
+- **Serif**: no se carga por default. Si aparece un acento editorial, se agrega Fraunces o Instrument Serif en ese momento.
+
+Carga única en `app/layout.tsx` vía `next/font/google` con `display: 'swap'` y `subsets: ['latin']`. El resto del código consume `var(--font-sans)` / `var(--font-mono)` / `var(--font-heading)` — nunca el nombre de la familia directo, para que un swap futuro sea un cambio puntual.
+
+### Estado actual del código (a 2026-05-17)
+
+`apps/web/app/globals.css` todavía tiene la versión preliminar del Step 4.5 (todo en `:root`, names `--brand-primary` / `--brand-accent` para la capa "semántica") + alias shadcn. **No es la arquitectura final**. La migración a las tres capas y al stack de fuentes nuevo se hace como parte del step de dark/light en Fase 4 (ver roadmap). Hasta entonces, los nombres actuales siguen siendo válidos para código que se agregue; al refactorizar, los componentes que ya usan utilities (`bg-card`, `text-foreground`, etc.) no cambian — solo las definiciones de las vars en `globals.css`/`tokens.css`.
 
 ## Mobile-first
 
