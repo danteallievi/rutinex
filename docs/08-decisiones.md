@@ -563,4 +563,43 @@ Escape hatches con sufijo `AcrossTenants` (`findAcrossTenants`, `findOneAcrossTe
 
 ---
 
+## ADR-019 — Roles: `RolesGuard` global + SUPERADMIN bypass
+
+**Contexto**: el Step 11 cablea el control de acceso por rol prometido en `docs/04-auth.md`. El decorador `@Roles(...)` marca handlers/controllers con la lista de roles permitidos del tenant (`OWNER`, `TRAINER`, `STUDENT`). El `RolesGuard` global se encadena después de `JwtAuthGuard` (popula `req.user`) y de `TenantGuard` (valida el slug vs el JWT). Hay dos decisiones de diseño que no son obvias.
+
+**Decisiones**:
+
+### 1. Sin `@Roles` → endpoint abierto a cualquier user autenticado
+
+Si no hay meta `@Roles` ni en el handler ni en la clase, el `RolesGuard` skipea y deja pasar. El endpoint queda accesible a cualquier user autenticado del tenant (el `TenantGuard` ya validó que el slug del header coincide con el JWT).
+
+Razón: el `RolesGuard` no es un gate de auth — eso es el `JwtAuthGuard`. Es un filtro de autorización por rol. Si el caller no escribió `@Roles(...)`, está diciendo explícitamente que cualquier rol del tenant puede entrar. La alternativa (denegar por default) obligaría a escribir `@Roles('OWNER','TRAINER','STUDENT')` en cada endpoint que es genuinamente open-to-all-tenant-users (típico: lectura de datos del propio tenant), agregando ruido sin valor.
+
+Riesgo: olvido. Si alguien diseña un endpoint sensible y se olvida del `@Roles`, queda abierto. Mitigación: code review + convención (los CRUD de Step 12+ siempre llevan `@Roles(...)` explícito, incluso cuando son "todos los roles del tenant").
+
+### 2. SUPERADMIN bypassa `RolesGuard` aunque la meta no lo incluya
+
+Si `req.user.isSuperadmin === true`, el guard devuelve `true` sin chequear roles. El SUPERADMIN no tiene `role` (es `null` en el JWT) y nunca matchearía contra `@Roles('OWNER'|'TRAINER'|'STUDENT')`. Sus rutas reales son `/superadmin/*` con `SuperadminGuard`.
+
+Razón: consistencia con el modelo conceptual del SUPERADMIN ("operador con permisos plenos"). En la práctica, un SUPERADMIN no toca rutas tenant-scoped — el `TenantGuard` (Step 10) lo bloquea antes con 403 `TENANT_MISMATCH` porque su `tenantId` es `null`. El bypass del `RolesGuard` cubre dos casos residuales:
+
+- Rutas marcadas `@SkipTenantGuard()` que llevan `@Roles(...)` (raras hoy; podría pasar mañana). Sin el bypass, un SUPERADMIN no podría operar esa ruta jamás, aunque la idea es que sí pueda.
+- Defensa en profundidad: si por un bug futuro un SUPERADMIN llegara al `RolesGuard` en una ruta tenant-scoped, el comportamiento esperado es "operador con permisos plenos pasa", no "operador con permisos plenos es bloqueado por un guard de tenant".
+
+No filtra existencia ni habilita acceso que no esté ya implícito en el flag `isSuperadmin`. El SUPERADMIN sigue sin poder leer datos tenant-scoped porque el `TenantScopedRepository` exige `tenant_id` en todas las queries — los services tenant-scoped no pasan ese filtro cuando el JWT es de SUPERADMIN.
+
+### 3. Códigos de error
+
+- **403 `FORBIDDEN_ROLE`**: el `role` del JWT no está en la lista permitida.
+
+**Consecuencias**:
+
+- Cada CRUD de Step 12+ se escribe con `@Roles(...)` explícito (no se asume "any authenticated"). La regla: si el endpoint tiene un control de acceso por rol, llevar `@Roles(...)`. Si no, comentar en el handler por qué.
+- `RolesGuard` se registra como `APP_GUARD` después de `TenantGuard` en `AuthModule.providers`. El orden es: `JwtAuthGuard` → `TenantGuard` → `RolesGuard`. NestJS los ejecuta en el orden en que se registran.
+- El guard skipea `@Public()` (consistente con `TenantGuard`). No tiene un mecanismo de skip propio: la ausencia de `@Roles` es el skip.
+- La ortogonalidad con `SuperadminGuard` queda preservada: el `SuperadminGuard` se aplica a controllers `/superadmin/*` y exige `isSuperadmin === true`; el `RolesGuard` se aplica a rutas tenant-scoped con `@Roles(...)` y deja pasar al SUPERADMIN. Ningún endpoint legítimo usa los dos a la vez.
+- **Riesgo**: si en el futuro queremos un rol "operador de tenant" entre OWNER y SUPERADMIN (ej. un soporte interno con acceso a un solo tenant), el modelo de `@Roles` cubre el caso agregando el nuevo rol al enum. El SUPERADMIN bypass sigue siendo correcto porque "operador con permisos plenos" es ortogonal al rol del tenant.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

@@ -208,6 +208,7 @@ Convención: `code` es un `UPPER_SNAKE_CASE` opcional. Se incluye cuando el fron
 | 400    | `CURRENT_PASSWORD_REQUIRED` | `POST /auth/change-password` en modo voluntario sin `currentPassword`                                                                                                                      | auth    |
 | 400    | `TENANT_SLUG_REQUIRED`      | `TenantGuard` global: ruta tenant-scoped sin header `x-tenant-slug` (o con header vacío)                                                                                                   | auth    |
 | 403    | `TENANT_MISMATCH`           | `TenantGuard` global: slug del header no resuelve a un tenant cuyo `id` matchee `req.user.tenantId`. Colapsa "slug inexistente" + "slug de otro tenant" (no se filtra existencia, ADR-018) | auth    |
+| 403    | `FORBIDDEN_ROLE`            | `RolesGuard` global: el `role` del JWT no está en la lista permitida por `@Roles(...)`. SUPERADMIN bypassa (ADR-019)                                                                       | auth    |
 
 > Mantener esta tabla cuando se agreguen códigos nuevos.
 

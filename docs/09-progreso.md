@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 10 completo. Próximo: Step 11 — Roles y guard de roles.
-**Última actualización**: 2026-05-17 — Step 10 (TenantGuard global + TenantScopedRepository + decoradores @TenantId/@SkipTenantGuard + refactor UsersService).
+**Paso actual**: Step 11 completo. Próximo: Step 12 — CRUD: Users del tenant (alta de TRAINER y STUDENT).
+**Última actualización**: 2026-05-17 — Step 11 (RolesGuard global + @Roles decorator + ADR-019 SUPERADMIN bypass).
 
 ## Cambios de doc
 
@@ -469,9 +469,46 @@ Notas:
 - El wrapper no protege queries con `createQueryBuilder()` ni `repo.query('SELECT ...')`. La convención sigue siendo "nunca tirar SQL sin `WHERE tenant_id` salvo justificación explícita". Si el riesgo crece, sumamos un linter custom.
 - El refactor de `UsersService` cambió la inyección: antes `@InjectRepository(User) repo: Repository<User>`; ahora `UsersRepository` como provider concreto en `UsersModule`. Los tests del service pasaron de mockear via `getRepositoryToken(User)` a mockear via `UsersRepository`. Sin cambios funcionales — sólo de cableado.
 
+### Step 11 — Roles y guard de roles (2026-05-17)
+
+`RolesGuard` global, decorador `@Roles(...)` y código de error `FORBIDDEN_ROLE`. SUPERADMIN bypassa (ADR-019). Sin endpoints reales en `src/` — el controller sintético vive sólo en el spec E2E (mismo patrón que Step 10).
+
+**Decorador `@Roles(...)`** en `apps/api/src/modules/auth/roles.decorator.ts`: `SetMetadata(ROLES_KEY, roles)` con `ROLES_KEY = 'roles'`. Acepta una o más entradas de `UserRole` (`'OWNER' | 'TRAINER' | 'STUDENT'`). Si no se aplica, el guard no exige rol — el endpoint queda abierto a cualquier user autenticado del tenant (ADR-019).
+
+**`RolesGuard`** en `apps/api/src/modules/auth/roles.guard.ts`:
+
+- Skipea `@Public()` (consistente con `TenantGuard`).
+- Skipea cuando no hay meta `@Roles` (handler ni clase) o cuando es un array vacío — endpoint sin gate por rol.
+- 401 defensivo si no hay `req.user` (bug de orden de guards).
+- SUPERADMIN bypassa (`req.user.isSuperadmin === true` → true). En la práctica el `TenantGuard` (Step 10) lo bloquea antes con `TENANT_MISMATCH` en rutas tenant-scoped; el bypass cubre rutas `@SkipTenantGuard()` con `@Roles(...)` y defensa en profundidad. Ver ADR-019.
+- Si `req.user.role` ∈ lista permitida → 200; si no → **403 `FORBIDDEN_ROLE`**.
+
+**Registración global** en `AuthModule.providers` como `APP_GUARD` después de `JwtAuthGuard` y `TenantGuard`. Orden final: `JwtAuthGuard` → `TenantGuard` → `RolesGuard` (NestJS respeta el orden de registración). También exportado para tests que lo quieran inyectar localmente.
+
+**Códigos de error nuevos** (documentados en `docs/05-api-conventions.md`):
+
+- 403 `FORBIDDEN_ROLE` — el `role` del JWT no matchea la lista permitida por `@Roles`.
+
+**Tests**:
+
+- Unit (`roles.guard.spec.ts`, 11 cases): skip por `@Public`, skip sin meta `@Roles`, skip con meta vacía, SUPERADMIN bypassa aunque el rol no esté en la lista, OWNER/TRAINER pasan con sus respectivas listas, STUDENT con `@Roles('OWNER')` → 403, TRAINER con `@Roles('OWNER')` → 403, 401 sin `user`, user con `role=null` y no-superadmin → 403 (caso defensivo imposible pero cubierto), handler-level override (Reflector.getAllAndOverride pone handler primero).
+- E2E (`roles-guard.e2e-spec.ts`, 15 cases): controller sintético `RolesTestController` con 6 endpoints (`/any` sin `@Roles`, `/owner-only`, `/trainer-only`, `/student-only`, `/staff` con dos roles, y `/owner-only-cross-tenant` con `@SkipTenantGuard + @Roles('OWNER')` para probar el SUPERADMIN bypass). Cubre cada cruce de role × endpoint relevante + el caso SUPERADMIN en ruta tenant-scoped (cae en `TENANT_MISMATCH` del Step 10, no llega al `RolesGuard`) y en ruta `@SkipTenantGuard` (bypassa con 200).
+
+**Decisión**: ADR-019 "Roles: `RolesGuard` global + SUPERADMIN bypass" — registra (1) sin `@Roles` el endpoint queda abierto a cualquier user autenticado del tenant (la default es "no gatear", no "denegar"), (2) SUPERADMIN bypassa por consistencia con "operador con permisos plenos", aunque en la práctica el `TenantGuard` lo bloquea antes en rutas tenant-scoped.
+
+Archivos clave: `apps/api/src/modules/auth/{roles.decorator,roles.guard,roles.guard.spec,auth.module}.ts`, `apps/api/test/roles-guard.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-019).
+
+Verificación: `pnpm lint` clean en root. `pnpm --filter @rutinex/api test` 157/157 (146 previos del Step 10 + 11 nuevos en roles-guard). `pnpm --filter @rutinex/api test:e2e` 81/81 (66 previos + 15 nuevos del roles-guard).
+
+Notas:
+
+- El controller sintético `test-roles-guard` vive sólo en el spec E2E — patrón heredado de Step 10. Cuando entren los CRUD reales con `@Roles` (Step 12+), pueden borrarse o dejarse como red de seguridad.
+- `Reflector.getAllAndOverride([handler, class])` pone el handler primero — así un `@Roles` a nivel handler **gana** sobre un `@Roles` a nivel clase. No es "merge": es "override", lo cual es lo esperable (si declaro a nivel handler, sobreescribo la default de la clase).
+- El guard tira `ForbiddenException` con `code` parseable. El filtro global (`HttpExceptionFilter`) propaga el `code` al body. Sin diferenciación entre "no tiene rol" y "rol no matchea" — el caller siempre ve `FORBIDDEN_ROLE`.
+
 ## Próxima acción concreta
 
-Step 11 — Roles y guard de roles: decorator `@Roles('OWNER'|'TRAINER'|'STUDENT')`, `RolesGuard` global que respeta `@Roles` por handler/controller, no aplica a SUPERADMIN (su guard es separado), endpoint dummy protegido por rol para E2E. Ver criterios completos en `docs/07-roadmap.md` → Step 11.
+Step 12 — CRUD: Users del tenant. OWNER crea TRAINER (password generada `must_change_password=true`); TRAINER crea STUDENT (sin password, DNI requerido). `POST /users/:id/reset-password` (OWNER → TRAINER del mismo tenant, revoca refresh tokens). `GET /users` con filtros + paginación offset. `PATCH /users/:id` (nombre, isActive). `DELETE /users/:id` (soft delete). Primer módulo con `@Roles` real + ese repositorio usando `TenantScopedRepository`. Ver criterios completos en `docs/07-roadmap.md` → Step 12.
 
 ## Pendientes / deudas técnicas
 

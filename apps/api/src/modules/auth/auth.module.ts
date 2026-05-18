@@ -14,6 +14,7 @@ import { JwtAuthGuard } from './jwt-auth.guard';
 import { JwtStrategy } from './jwt.strategy';
 import { PasswordService } from './password.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { RolesGuard } from './roles.guard';
 import { SuperadminGuard } from './superadmin.guard';
 import { TenantGuard } from './tenant.guard';
 
@@ -48,9 +49,11 @@ import { TenantGuard } from './tenant.guard';
     JwtAuthGuard,
     SuperadminGuard,
     TenantGuard,
+    RolesGuard,
     // Orden de APP_GUARD: NestJS los ejecuta en el orden en que se registran.
     // JwtAuthGuard primero (popula req.user), TenantGuard después (valida
-    // x-tenant-slug vs req.user.tenantId).
+    // x-tenant-slug vs req.user.tenantId), RolesGuard al final (valida
+    // @Roles contra req.user.role).
     {
       provide: APP_GUARD,
       useClass: JwtAuthGuard,
@@ -59,7 +62,17 @@ import { TenantGuard } from './tenant.guard';
       provide: APP_GUARD,
       useClass: TenantGuard,
     },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
   ],
-  exports: [PasswordService, JwtAuthGuard, SuperadminGuard, TenantGuard],
+  exports: [
+    PasswordService,
+    JwtAuthGuard,
+    SuperadminGuard,
+    TenantGuard,
+    RolesGuard,
+  ],
 })
 export class AuthModule {}
