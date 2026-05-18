@@ -773,4 +773,87 @@ Cada tenant tiene su catálogo de exercises (FK `tenant_id NOT NULL`). El doc de
 
 ---
 
+## ADR-023 — Storage de media (R2): presigned PUT directo, bucket público, sin cleanup en MVP
+
+**Contexto**: el Step 15 implementa el storage de gifs/videos/imágenes de exercises sobre Cloudflare R2 (ADR-004). Quedan abiertas varias sub-decisiones que conviene clavar antes de tocar código del frontend (Step 24) y para que los siguientes módulos (`routines`, `comments`) puedan reusar el patrón.
+
+**Decisiones**:
+
+### 1. Upload directo del browser con presigned PUT (no proxy via API)
+
+`POST /media/upload-url` firma una URL contra R2 con `PutObjectCommand` y el cliente sube el binario por PUT directo, sin tocar el API. Razones:
+
+- Egress de R2 es gratis (ADR-004), pero el ancho de banda de subida del API (Railway/Fly) sí cuesta. Proxy via API es N veces el tráfico real (cliente→API→R2).
+- El API queda fuera del path crítico para uploads grandes (video 50MB), lo que mantiene el process pool libre.
+- El SDK S3-compatible (`@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner`) es estándar y trivialmente reemplazable si en el futuro se cambia el provider.
+
+Trade-off: el API no ve el binario, así que no puede validar contenido (¿es realmente un mp4?). El compromiso es que `POST /media/confirm` hace `HeadObject` contra el blob ya subido y verifica `Content-Type` + `Content-Length` reales antes de persistir el `mediaUrl`. Si la validación falla, borra el blob.
+
+### 2. Acceso público vía dominio público de R2 (no presigned GET por request)
+
+Bucket configurado con acceso público de lectura. El `mediaUrl` que persiste el API en `exercises.media_url` es la URL absoluta del objeto (`{R2_PUBLIC_URL}/{key}`). Razones:
+
+- STUDENT ve videos de cada ejercicio durante la sesión — un presigned GET por cada playback es complejidad innecesaria y rompe el caching del browser/CDN.
+- El catálogo de exercises es operativamente público dentro del tenant (cualquier rol autenticado puede leer, ADR-022); ofuscar la URL no agrega seguridad real, sólo fricción.
+- Los blobs no contienen información sensible (son demos de ejercicios). Si el día de mañana aparece media privada (foto del alumno, video de evaluación), se introduce un segundo bucket privado + presigned GET para esa entidad — sin tocar el catálogo de exercises.
+
+Trade-off: cualquiera con la URL puede ver el blob. Aceptable: las URLs no se filtran ni se enumeran (key incluye UUID v4), y la entidad la conoce sólo el tenant.
+
+### 3. Path scheme `tenants/<tenantId>/exercises/<uuid>.<ext>`
+
+Cada blob vive bajo el prefijo del tenant que lo creó (UUID, no slug — los slugs pueden cambiar; los UUIDs no). El subprefijo `exercises/` deja espacio para futuros kinds (`routines/`, `comments/`, etc.). El UUID v4 del archivo evita colisiones sin coordinación. La extensión se deriva determinísticamente del `Content-Type` (ver `MEDIA_POLICY`).
+
+El `tenantId` en la key sirve para una segunda defensa (además del `TenantGuard`): `POST /media/confirm` rechaza con `MEDIA_KEY_NOT_OWNED` si la key no empieza con `tenants/<jwt.tenantId>/`. Sin esta defensa, un OWNER de A podría confirmar una key que apunte al blob de B (aunque la persistencia caería igual por el lookup tenant-scoped del exercise — defensa en profundidad).
+
+### 4. Límites de tamaño y mime types por kind
+
+Política fija (Step 15 del roadmap):
+
+| kind  | maxBytes | mime types aceptados                         |
+| ----- | -------- | -------------------------------------------- |
+| video | 50 MB    | `video/mp4`, `video/webm`, `video/quicktime` |
+| gif   | 10 MB    | `image/gif`                                  |
+| image | 5 MB     | `image/jpeg`, `image/png`, `image/webp`      |
+
+El `sizeBytes` declarado en `POST /media/upload-url` es fail-fast: si ya supera el límite, no se firma nada. Pero el presigned PUT de R2 no firma `Content-Length`, así que un cliente malicioso podría subir más. El control real está en `POST /media/confirm`: `HeadObject` lee el `Content-Length` real y rechaza con `MEDIA_SIZE_EXCEEDED` (borrando el blob) si supera el límite. Lo mismo con `Content-Type`: el `getSignedUrl` firma el `ContentType` declarado (si el cliente intenta cambiarlo en el PUT, la firma falla), pero el confirm igual revalida el real con un `HeadObject` para defensa en profundidad.
+
+### 5. Endpoint genérico (`POST /media/upload-url` + `POST /media/confirm`), no acoplado a exercises
+
+El roadmap pedía `/media/upload-url` + `/media/confirm` y queda así. Razones:
+
+- Cuando aparezcan rutinas con imagen de portada (Step 16+) o comments con foto adjunta, se reusa el mismo endpoint cambiando el path scheme. El `confirm` hoy sólo asocia a exercise; mañana se discrimina por un campo extra (`{ kind: 'exercise' | 'routine', id }`). Cambio sin breaking.
+- El upload no necesita conocer el exercise: el cliente lo sabe en frontend y manda los dos requests por separado. Mantiene los dos casos limpios (upload sin exercise = error recoverable: re-confirmás cuando lo crees; upload con exercise = caso happy).
+
+### 6. Cleanup de orphans: nada en MVP, deuda documentada
+
+Si el cliente sube pero nunca llama `POST /media/confirm` (cerró el browser, error de red, etc.), el blob queda huérfano en R2. En MVP es aceptable:
+
+- Volumen bajo (decenas/cientos de tenants × pocos uploads/día).
+- Plan gratuito de R2 incluye 10GB; con esos números el costo de blobs huérfanos es marginal.
+- Implementar cleanup ahora (cron periódico o lifecycle rule de R2 sobre un prefijo `pending/`) es complejidad prematura.
+
+Cuando duela (decisión cualitativa: si vemos que el bucket crece desproporcionado al uso útil), las opciones son: (a) lifecycle rule de R2 sobre un prefijo `pending/` con expiración a 24h + el confirm copia/move al path final, (b) cron job en el API que cruza R2 vs `exercises.media_url` y borra los no referenciados. La (a) es más barata operacionalmente; la (b) más explícita.
+
+### 7. Dev/test environment
+
+- **Tests** (unit + E2E): mock del cliente S3 vía `overrideProvider(R2_CLIENT)` en el `TestingModule`. `getSignedUrl` se mockea con `jest.mock('@aws-sdk/s3-request-presigner')`. Nunca se toca R2 real.
+- **Dev manual**: el provider lee env (`R2_*`); si están vacías, devuelve `null` y `MediaService` responde `503 MEDIA_NOT_CONFIGURED`. Quien quiera probar uploads end-to-end en dev configura su propio bucket de R2 (bucket separado del de prod). No usamos MinIO ni un docker compose extra: agregar otro servicio para una superficie que ya funciona con mocks era complejidad innecesaria.
+
+### 8. Códigos de error nuevos
+
+- **400 `MEDIA_CONTENT_TYPE_NOT_ALLOWED`** — `contentType` no permitido para el `kind` declarado, o el `HeadObject` del confirm devuelve un mime fuera de la política.
+- **400 `MEDIA_SIZE_EXCEEDED`** — `sizeBytes` declarado supera el límite, o el size real del blob (vía HeadObject) lo supera.
+- **400 `MEDIA_KEY_NOT_OWNED`** — la `key` enviada al confirm no empieza con `tenants/<jwt.tenantId>/`.
+- **400 `MEDIA_OBJECT_NOT_FOUND`** — el confirm hizo `HeadObject` y el objeto no existe en el bucket (el cliente no subió, o subió a otra key).
+- **503 `MEDIA_NOT_CONFIGURED`** — faltan env vars `R2_*` y el endpoint no puede operar (típicamente en dev sin credenciales).
+
+**Consecuencias**:
+
+- `MediaController` queda muy delgado (dos endpoints, sólo `@Roles('OWNER','TRAINER')`). Toda la lógica de validación/persistencia vive en `MediaService`.
+- `MediaService` depende de `ExercisesService.update` para persistir el `mediaUrl` final, reusando la validación de coherencia `mediaType`↔`mediaUrl` de ADR-022 sin duplicarla. Cuando aparezcan más kinds (routines, comments), `confirm` se va a discriminar por el target y delegar a sus respectivos services.
+- El presigned PUT firma sólo el `ContentType` y la `Key`, no el `Content-Length`. El control de size real recae en el confirm; sin él, un malicioso podría llenar el bucket. Aceptable hoy porque sólo OWNER/TRAINER tienen acceso y son partes confiables; cuando se abra al STUDENT (no previsto), revisar.
+- La extensión en la key es determinística por mime (`video/mp4 → .mp4`, etc.). Si un browser sube con un mime exótico no contemplado, el upload-url devuelve `MEDIA_CONTENT_TYPE_NOT_ALLOWED` antes de firmar nada.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

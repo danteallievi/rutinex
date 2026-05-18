@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 14 completo. Próximo: Step 15 — Storage de media (R2).
-**Última actualización**: 2026-05-18 — Step 14 (CRUD Exercises + ADR-022).
+**Paso actual**: Step 15 completo. Próximo: Step 16 — CRUD Routines + RoutineItems.
+**Última actualización**: 2026-05-18 — Step 15 (Storage de media R2 + ADR-023).
 
 ## Cambios de doc
 
@@ -672,9 +672,65 @@ Notas:
 - El `@ValidateIf((_, value) => value !== null)` en `UpdateExerciseDto.mediaUrl` es lo que permite mandar `null` explícito (limpiar media) sin que `@IsUrl` lo rechace. La validación de URL aplica sólo cuando el valor es string.
 - Los E2E del cross-tenant verifican explícitamente que `GET/PATCH/DELETE /exercises/:id` con id de otro tenant devuelven `EXERCISE_NOT_FOUND` (no filtran existencia) — alineado con el patrón establecido en ADR-018/ADR-020.
 
+### Step 15 — Storage de media (R2) (2026-05-18)
+
+Storage de gifs/videos/imágenes de exercises sobre Cloudflare R2. Presigned PUT directo del browser (sin proxy via API), bucket público de lectura, validación real con `HeadObject` en el confirm. Decisiones cristalizadas en **ADR-023** (presign directo, dominio público, path scheme, límites, sin cleanup en MVP, mock del SDK en tests).
+
+**Endpoints** (`apps/api/src/modules/media/media.controller.ts`, ambos `@Roles('OWNER','TRAINER')` a nivel clase):
+
+- `POST /media/upload-url` (`HttpStatus.OK`): body `{ kind, contentType, sizeBytes }`. Valida que el `contentType` esté permitido para el `kind` y que `sizeBytes` no supere el límite (fail-fast). Genera key `tenants/<tenantId>/exercises/<uuid>.<ext>` (extensión derivada del mime), firma `PutObjectCommand` con `getSignedUrl` (TTL configurable, default 300s). Response `{ uploadUrl, key, publicUrl, contentType, expiresAt }`. `publicUrl` es la URL final que va a quedar en `exercises.media_url` post-confirm.
+- `POST /media/confirm` (`HttpStatus.OK`): body `{ key, exerciseId }`. Valida que `key` empiece con `tenants/<jwt.tenantId>/` (`MEDIA_KEY_NOT_OWNED` si no), hace `HeadObject` contra R2 (`MEDIA_OBJECT_NOT_FOUND` si 404), valida `Content-Type` real vs política por kind (`MEDIA_CONTENT_TYPE_NOT_ALLOWED` si no) y `Content-Length` real vs límite (`MEDIA_SIZE_EXCEEDED` si supera), llama a `ExercisesService.update(tenantId, exerciseId, { mediaType, mediaUrl })` reusando la validación de coherencia de ADR-022 — si tira `EXERCISE_NOT_FOUND`, borra el blob de R2 antes de propagar el error. Si la validación de contenido falla, borra el blob y devuelve 400. Cuando todo OK, devuelve `{ exercise: ExerciseResponse }`.
+
+**`MediaService`** (`apps/api/src/modules/media/media.service.ts`):
+
+- Inyecta `S3Client | null` (token `R2_CLIENT`) + `R2Config | null` (token `R2_CONFIG`) + `ExercisesService`. Si alguno es null (env vars faltantes), tira `503 MEDIA_NOT_CONFIGURED` en cualquier operación.
+- `createUploadUrl(tenantId, dto)` → `UploadUrlResponse`. Valida kind/contentType/size, firma `PutObjectCommand`.
+- `confirm(tenantId, dto)` → `ConfirmMediaResponse`. Verifica ownership por prefijo de key, `HeadObject`, valida content real, persiste vía `ExercisesService.update`. Si falla en cualquier paso post-Head (incluyendo el update del exercise), borra el blob con `DeleteObjectCommand` antes de propagar — guard de orphans básico para casos non-happy.
+
+**Provider de R2** (`apps/api/src/modules/media/r2.config.ts`): `buildR2Client()` y `buildR2Config()` leen env (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL`, `R2_PRESIGN_TTL_SECONDS`); si falta alguna del set requerido, devuelven `null`. Tokens DI `R2_CLIENT` y `R2_CONFIG` se sobreescriben en tests vía `overrideProvider`. Endpoint S3: `https://${accountId}.r2.cloudflarestorage.com`, region `auto`.
+
+**DTOs** (`apps/api/src/modules/media/dto/`):
+
+- `CreateUploadUrlDto`: `kind` (`@IsIn(['video','gif','image'])`), `contentType` (string, max 100), `sizeBytes` (int >= 1).
+- `ConfirmMediaDto`: `key` (string, 1-512), `exerciseId` (UUID).
+- `UploadUrlResponse` / `ConfirmMediaResponse`: shapes públicas tipadas.
+
+**Política `MEDIA_POLICY`** (`apps/api/src/modules/media/media-types.ts`): tabla `kind → { maxBytes, mimeTypes, extensionByMime }`. Cambio de límites o mimes requiere un solo edit acá + actualización de la tabla en ADR-023.
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- **400 `MEDIA_CONTENT_TYPE_NOT_ALLOWED`** — contentType (declarado o real) fuera de la política del kind.
+- **400 `MEDIA_SIZE_EXCEEDED`** — sizeBytes (declarado o real) supera el límite del kind.
+- **400 `MEDIA_KEY_NOT_OWNED`** — la key no empieza con `tenants/<jwt.tenantId>/`.
+- **400 `MEDIA_OBJECT_NOT_FOUND`** — HeadObject contra R2 falla con 404.
+- **503 `MEDIA_NOT_CONFIGURED`** — env vars `R2_*` faltantes en el entorno.
+
+**Wiring**: `MediaModule` registra controller + service + factories de `R2_CLIENT`/`R2_CONFIG`; importa `ExercisesModule` para inyectar `ExercisesService`. `AppModule` lo importa.
+
+**.env.example** (`apps/api/.env.example`): nuevas vars `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_PUBLIC_URL`, `R2_PRESIGN_TTL_SECONDS=300` documentadas. En dev quedan vacías por default; el endpoint responde 503 si alguien lo invoca sin config.
+
+**Tests**:
+
+- Unit (`media.service.spec.ts`, 17 cases): `createUploadUrl` (video/mp4 + gif + image + variantes de extensión, contentType no permitido, size excedido, 503 si no configurado), `confirm` (happy path, key foreign 400, HEAD 404 → 400, contentType real fuera de política → 400 + delete, size real excedido → 400 + delete, ExercisesService.update tira → propaga + delete, 503 si no configurado). Mock del SDK con `jest.mock('@aws-sdk/s3-request-presigner')`.
+- E2E (`media.e2e-spec.ts`, 17 cases): cubre los 2 endpoints, jerarquía OWNER/TRAINER/STUDENT (STUDENT 403 en ambos), validaciones (contentType, size, kind inválido), guard chain (sin slug → 400 TENANT_SLUG_REQUIRED, sin bearer → 401), happy path completo (presign → confirm → DB persiste mediaUrl), key cross-tenant 400 `MEDIA_KEY_NOT_OWNED`, exercise inexistente 404 `EXERCISE_NOT_FOUND` con DELETE del blob, exercise de otro tenant 404 con DELETE. Cliente S3 sobreescrito vía `overrideProvider(R2_CLIENT)`; `getSignedUrl` mockeado.
+
+**Dependencias agregadas** (`apps/api/package.json`): `@aws-sdk/client-s3` y `@aws-sdk/s3-request-presigner` (ambos `^3.x`). SDK modular: solo se cargan los comandos usados (`PutObjectCommand`, `HeadObjectCommand`, `DeleteObjectCommand`, `S3Client`).
+
+Archivos clave: `apps/api/src/modules/media/{media.module,media.controller,media.service,media.service.spec,media-types,r2.config}.ts`, `apps/api/src/modules/media/dto/{create-upload-url,confirm-media,media.response}.ts`, `apps/api/src/app.module.ts` (import del módulo), `apps/api/test/media.e2e-spec.ts`, `apps/api/.env.example`, `docs/05-api-conventions.md` (codes), `docs/08-decisiones.md` (ADR-023).
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 236/236 (219 previos del Step 14 + 17 nuevos en media-service). `pnpm --filter @rutinex/api test:e2e` 186/186 (169 previos + 17 nuevos en media.e2e-spec.ts).
+
+Notas:
+
+- El presigned PUT no firma `Content-Length`, así que el control real de tamaño está en `POST /media/confirm` (via HeadObject). Sin esa segunda validación, un cliente podría subir hasta saturar el bucket. Aceptable porque hoy sólo OWNER/TRAINER acceden; si en el futuro se expone presign al STUDENT, revisar.
+- `getSignedUrl` firma el `ContentType` declarado: si el cliente cambia el header en el PUT, la firma S3 falla con `SignatureDoesNotMatch`. R2 respeta esa semántica (es S3-compatible). Aún así, el confirm revalida el real con HeadObject como defensa en profundidad.
+- El `kind` en el path (`tenants/<tenantId>/exercises/...`) deja espacio para futuros tipos (`routines/`, `comments/`) sin migrar blobs existentes. Hoy es siempre `exercises/` porque el confirm sólo asocia a exercise.
+- `ExercisesService.update` ya valida coherencia `mediaType`↔`mediaUrl` (ADR-022); como el confirm pasa los dos a la vez derivados del mime real, no puede caer en `EXERCISE_MEDIA_INCONSISTENT` por design. Si en el futuro el confirm permite limpiar media (`null`), revisar.
+- Cleanup de orphans (uploads sin confirm) queda como deuda explícita en ADR-023 — sin cron ni lifecycle rules en MVP. Cuando el bucket crezca, definir la estrategia (preferentemente lifecycle rule de R2 sobre un prefijo `pending/`).
+
 ## Próxima acción concreta
 
-Step 15 — Storage de media (R2). Cloudflare R2 para upload de gifs/videos/images de ejercicios. SDK S3-compatible, presigned URLs, contrato del frontend. Ver criterios completos en `docs/07-roadmap.md` → Step 15.
+Step 16 — CRUD Routines + RoutineItems. Entities + migración (rutina con items embebidos ordenados, FKs a `exercises`), endpoints `POST /routines` (con items), `PATCH /routines/:id` (reordenar/agregar/quitar), `GET /routines/:id` con items y ejercicios resueltos. Ver criterios completos en `docs/07-roadmap.md` → Step 16.
 
 ## Pendientes / deudas técnicas
 
