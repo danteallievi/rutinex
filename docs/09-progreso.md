@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 18 completo. Próximo: Step 19 — Personal Records.
-**Última actualización**: 2026-05-18 — Step 18 (Sessions + Sets + ADR-026).
+**Paso actual**: Step 19 completo. Próximo: Step 20 — Comments.
+**Última actualización**: 2026-05-18 — Step 19 (Personal Records + ADR-027).
 
 ## Cambios de doc
 
@@ -910,9 +910,52 @@ Notas:
 - El UNIQUE parcial sólo cubre `WHERE completed_at IS NULL`. Dos sesiones completadas sobre el mismo assignment con el mismo `started_at` no violan ningún constraint — el caller debería ordenarse por `(started_at, id)` y aceptar duplicados como histórico legítimo.
 - La inmutabilidad de `routine_items.id` post-PATCH (ADR-024 §3) se valida acá: si un trainer hace PATCH replace-all del routine mientras una sesión está abierta, los `routineItemId` del snapshot ya no existen en la tabla viva, pero `sets.routine_item_id` con `ON DELETE SET NULL` y la validación contra snapshot (no contra tabla) mantienen el flow funcionando — el STUDENT termina la sesión con el snapshot original.
 
+### Step 19 — Personal Records (2026-05-18)
+
+Tabla `personal_records` materializada con 3 record_types por `(student, exercise)`, cálculo dentro de la transacción del `POST /sessions/:id/sets`, dos endpoints `GET` con jerarquía de lectura, y concurrencia blindada vía `INSERT … ON CONFLICT … DO UPDATE … WHERE EXCLUDED > pr` (Postgres serializa el conflict resolution con row lock — sin advisory locks ni REPEATABLE READ). Decisiones cristalizadas en **ADR-027**.
+
+**Entity + migración**: `PersonalRecord` en `apps/api/src/modules/personal-records/entities/personal-record.entity.ts` con `id`, `tenantId` (FK RESTRICT a tenants), `studentId` (FK RESTRICT a users), `exerciseId` (FK RESTRICT a exercises), `recordType` (enum `personal_record_type`: `max_weight`/`max_reps_at_weight`/`max_volume`), `weightKg` (numeric(6,2) NOT NULL — sets bodyweight con `weight_kg=null` se skipean del cálculo), `reps` (int), `achievedAt` (@CreateDateColumn), `setId` (FK RESTRICT a sets — protege la evidencia). Índices: `ix_personal_records_*` (4) + UNIQUE `uq_personal_records_target ON (tenant_id, student_id, exercise_id, record_type)` que sirve como conflict target del UPSERT atómico.
+
+Migración `apps/api/src/migrations/1779600000000-InitPersonalRecords.ts` a mano (mismo patrón que `InitSessionsAndSets`): crea el enum `personal_record_type`, la tabla con FKs nombrados explícito, los 4 índices y el UNIQUE compuesto. Up/down testeados (drift check via `migration:generate` no encuentra cambios).
+
+**`PersonalRecordsService`** (`apps/api/src/modules/personal-records/personal-records.service.ts`):
+
+- `computeAndUpsertForSet(manager, { tenantId, studentId, exerciseId, setId, reps, weightKg })`: emite 3 UPSERTs (uno por record_type) usando `manager.query` raw — el INSERT crea el row si no había PR previo; el `DO UPDATE … WHERE` actualiza sólo si la métrica nueva supera la existente (strict `<`, hard-PR). Si `weightKg === null` retorna early sin emitir nada.
+- `listByStudent(tenantId, actor, studentId)`: validación de jerarquía + `find` ordenado por `(exerciseId, recordType)`.
+- `listByStudentAndExercise(tenantId, actor, studentId, exerciseId)`: idem con filtro adicional.
+- Helper `assertActorCanReadStudent(tenantId, actor, studentId)`: 404 `STUDENT_NOT_FOUND` si el user no existe en el tenant o no es STUDENT; 403 `FORBIDDEN_ROLE_HIERARCHY` si el actor no tiene jerarquía (STUDENT cross-self, TRAINER fuera de sus students).
+
+**`PersonalRecordsController`** (`apps/api/src/modules/personal-records/personal-records.controller.ts`): `@Controller()` sin prefix (mismo patrón que assignments). `GET /students/:studentId/personal-records` y `GET /students/:studentId/personal-records/:exerciseId`. Sin `@Roles` — jerarquía en service.
+
+**DTOs** (`apps/api/src/modules/personal-records/dto/`):
+
+- `PersonalRecordResponse`: shape ligero con `weightKg` como `number` (conversión de `numeric` string → number en el helper `toPersonalRecordResponse`).
+
+**Wiring**: `PersonalRecordsModule` registra controller + service + repository, exporta el service. `SessionsModule` importa `PersonalRecordsModule` para inyectar `PersonalRecordsService` en `SessionsService.addSet` (después del INSERT del set, dentro de la misma transacción). `AppModule` importa `PersonalRecordsModule` después de `SessionsModule`.
+
+**Cross-cutting**: `SessionsService.addSet` ahora captura el `id` del set persistido (`setsRepo.save(...)` retorna la entity con `id` resuelto), normaliza `weightKg` a una sola variable y llama a `computeAndUpsertForSet` dentro de la transacción. La unit test del service en sessions agrega un mock del `PersonalRecordsService` (`computeAndUpsertForSet: jest.fn().mockResolvedValue(undefined)`) para no acoplar test de sessions con el cálculo de PRs.
+
+**Códigos de error**: reuso de `STUDENT_NOT_FOUND` (404, módulo assignments → ahora también personal-records) y `FORBIDDEN_ROLE_HIERARCHY` (403, transversal). Sin codes nuevos — el cálculo de PR es deterministico, no produce errores de negocio propios.
+
+**Tests**:
+
+- Unit (`personal-records.service.spec.ts`, 14 cases): `computeAndUpsertForSet` (emite 3 UPSERTs con params correctos; cada UPSERT usa el WHERE estricto correspondiente; `weightKg=null` no emite nada; `weightKg=0` sí emite). `listByStudent` (OWNER, TRAINER propio, TRAINER cross 403, STUDENT self, STUDENT cross 403, 404 inexistente, 404 user no-STUDENT). `listByStudentAndExercise` (OWNER, sin PRs → `[]`, STUDENT cross 403).
+- E2E (`personal-records.e2e-spec.ts`, 20 cases): cálculo dentro de addSet (primer set crea 3 PRs; siguiente con más peso actualiza max_weight, mantiene reps inferior; empate exacto preserva achieved_at y set_id — hard-PR; weightKg=null no crea PRs; PRs por `(student, exercise)` aislados entre students). **Concurrencia**: `Promise.all` de 2 POST /sets sobre el mismo exercise en routine_items distintos → 1 PR final por record_type, valores ganadores correctos (max_weight 100, max_reps 8 con weight 90, max_volume 720). GET list/by-exercise con todos los actores + 404 cross-tenant + 403 cross-student/trainer + 200 con `[]` para exercise sin sets. FK RESTRICT validado con `DELETE FROM sets` → error 23503.
+
+Verificación: `pnpm lint` clean en root; `pnpm format:check` clean; `pnpm --filter @rutinex/api test` 306/306 (292 previos + 14 nuevos); `pnpm --filter @rutinex/api test:e2e` 304/304 (284 previos + 20 nuevos).
+
+Archivos clave: `apps/api/src/modules/personal-records/{personal-records.module,personal-records.controller,personal-records.service,personal-records.service.spec,personal-records.repository}.ts`, `apps/api/src/modules/personal-records/entities/personal-record.entity.ts`, `apps/api/src/modules/personal-records/dto/personal-record.response.ts`, `apps/api/src/migrations/1779600000000-InitPersonalRecords.ts`, `apps/api/src/modules/sessions/{sessions.service,sessions.service.spec,sessions.module}.ts` (wiring del cálculo), `apps/api/src/app.module.ts` (import), `apps/api/test/personal-records.e2e-spec.ts`, `docs/02-dominio.md` (constraints + FK RESTRICT + F5 actualizado), `docs/05-api-conventions.md` (codes reusados para el módulo), `docs/08-decisiones.md` (ADR-027).
+
+Notas:
+
+- El conflict resolution se hace con `ON CONFLICT (col_list)` (no `ON CONFLICT ON CONSTRAINT`) porque el `CREATE UNIQUE INDEX` crea un índice sin nombre de constraint asociado; Postgres infiere el arbiter desde el column list del índice. Funciona igual y evita acoplar el SQL al nombre de la constraint.
+- El test de empate verifica `before.id === after.id` y `before.setId === after.setId` después del segundo POST — el `WHERE` estricto preserva la fila original. Si en el futuro la política cambia a soft-PR, este test rompe explícito.
+- El test de concurrencia depende de que ambos POSTs corran "lo suficientemente en paralelo" para entrar al conflict. En la práctica las dos transacciones de TypeORM se programan ~simultáneamente con `Promise.all`; el conflict path se ejerce empíricamente porque el INSERT del segundo ya ve el `target` UNIQUE ocupado por el primer commit. Si en CI esto se vuelve flaky, agregar un barrier de `SELECT pg_advisory_xact_lock(...)` artificial en el test para forzar el orden.
+- `max_reps_at_weight` en MVP es "max reps en una serie con peso > NULL", no "max reps a un peso específico" — el nombre del enum quedó por compatibilidad con `docs/02-dominio.md` ya escrito. Si se quiere clusterizar por peso, la migración futura cambia la semántica + agrega columnas / nuevo enum (ver ADR-027 §2).
+
 ## Próxima acción concreta
 
-Step 19 — Personal Records. Entity `PersonalRecord` (`tenant_id`, `student_id`, `exercise_id`, `record_type`, `weight_kg`, `reps`, `achieved_at`, `set_id`) + migración. Cálculo dentro de la transacción de `POST /sessions/:id/sets`: si el set supera el PR previo, upsert. Endpoints `GET /students/:id/personal-records` y `GET /students/:id/personal-records/:exerciseId`. Criterio del roadmap: E2E con test de concurrencia (dos POST simultáneos no rompen el PR — transacción + isolation). Ver `docs/07-roadmap.md` → Step 19.
+Step 20 — Comments. Entity `Comment` (`tenant_id`, `student_id`, `exercise_id?`, `session_id?`, `body`, `created_at`) + migración. Endpoints `POST /comments`, `GET /comments` filtrable. Sólo el dueño puede borrar el suyo. Ver `docs/07-roadmap.md` → Step 20.
 
 ## Pendientes / deudas técnicas
 

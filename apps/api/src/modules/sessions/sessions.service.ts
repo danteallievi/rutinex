@@ -14,6 +14,7 @@ import {
   todayDateString,
 } from '../assignments/dto/assignment.response';
 import { Exercise } from '../exercises/entities/exercise.entity';
+import { PersonalRecordsService } from '../personal-records/personal-records.service';
 import { toRoutineResponse } from '../routines/dto/routine.response';
 import { RoutineItem } from '../routines/entities/routine-item.entity';
 import { Routine } from '../routines/entities/routine.entity';
@@ -59,6 +60,7 @@ export class SessionsService {
   constructor(
     private readonly sessionsRepository: SessionsRepository,
     private readonly dataSource: DataSource,
+    private readonly personalRecordsService: PersonalRecordsService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -251,7 +253,11 @@ export class SessionsService {
       }
 
       const setsRepo = manager.getRepository(WorkoutSet);
-      await setsRepo.save(
+      const normalizedWeight =
+        dto.weightKg === undefined || dto.weightKg === null
+          ? null
+          : dto.weightKg;
+      const persisted = await setsRepo.save(
         setsRepo.create({
           tenantId,
           sessionId: session.id,
@@ -264,11 +270,22 @@ export class SessionsService {
           // pg lo serializa a numeric sin perder precisión hasta los 2 decimales
           // permitidos por el DTO.
           weightKg:
-            dto.weightKg === undefined || dto.weightKg === null
-              ? null
-              : dto.weightKg.toFixed(2),
+            normalizedWeight === null ? null : normalizedWeight.toFixed(2),
         }),
       );
+
+      // Step 19 / ADR-027: cálculo de PRs dentro de la misma transacción —
+      // si el set supera el PR previo de `(student, exercise, record_type)`,
+      // se upsertea con ON CONFLICT atómico. Sets con `weightKg=null`
+      // (bodyweight) se skipean por dentro del service.
+      await this.personalRecordsService.computeAndUpsertForSet(manager, {
+        tenantId,
+        studentId: session.studentId,
+        exerciseId: snapshotItem.exerciseId,
+        setId: persisted.id,
+        reps: dto.reps,
+        weightKg: normalizedWeight,
+      });
 
       const allSets = await setsRepo.find({
         where: { tenantId, sessionId: session.id },

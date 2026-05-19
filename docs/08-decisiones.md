@@ -1165,4 +1165,130 @@ Documentada en `docs/05-api-conventions.md`:
 
 ---
 
+## ADR-027 — Personal Records: 3 record_types, hard-PR, UPSERT atómico con ON CONFLICT … WHERE
+
+**Contexto**: el Step 19 introduce `personal_records` — la tabla materializada de PRs que el alumno consulta sin scanear `sets`. El cálculo corre dentro de la transacción del `POST /sessions/:id/sets`. Decisiones a cerrar: qué métricas se calculan, qué pasa en empate, qué hacer con sets bodyweight, y cómo blindar la concurrencia (dos POSTs simultáneos sobre el mismo `(student, exercise)`).
+
+**Decisiones**:
+
+### 1. Endpoints (2 GET) + cálculo dentro de `addSet`
+
+- `GET /students/:studentId/personal-records` (sin `@Roles`, jerarquía en service): todos los PRs del student.
+- `GET /students/:studentId/personal-records/:exerciseId`: filtra por exercise.
+- `POST /sessions/:id/sets` invoca `PersonalRecordsService.computeAndUpsertForSet(manager, …)` después del INSERT del set, **en la misma transacción**. Si la transacción falla (ej. set duplicado captado por el service), nada se persiste — el PR queda consistente con `sets`.
+
+`/students/:studentId/personal-records/:exerciseId` con un `exerciseId` que no tiene PRs devuelve `[]` (no 404). Misma política que cualquier filtro: la ausencia de filas no es un error.
+
+### 2. Los tres `record_type` siempre se calculan
+
+`personal_records.record_type` enum tiene tres valores (`max_weight`, `max_reps_at_weight`, `max_volume`), todos materializados al subir un set. Semántica simplificada para MVP:
+
+- **`max_weight`**: el set con mayor `weight_kg` que el alumno haya logrado para este exercise. El row guarda `(weight_kg, reps)` de ese set.
+- **`max_reps_at_weight`**: el set con mayor `reps` en cualquier weight (sin clustering por "peso redondo"). Guarda `(weight_kg, reps)` para que el cliente muestre el contexto. El nombre histórico del enum se preservó por compatibilidad con el shape de DB ya documentado.
+- **`max_volume`**: el set con mayor `weight_kg × reps` (volumen single-set). Guarda `(weight_kg, reps)`.
+
+Alternativas descartadas:
+
+- **Clustering de `max_reps_at_weight` por peso "redondo"**: implicaría N rows por exercise (uno por bucket de peso). Rompe el UNIQUE `(tenant_id, student_id, exercise_id, record_type)` ya escrito en `docs/02-dominio.md` y agrega una decisión más (¿buckets de 2.5kg? ¿5%?). Diferido.
+- **Computar PRs lazy** (al hacer GET): más simple en escritura pero hace los GETs caros con scan de `sets`. La idea de materializar es justamente que el GET sea barato.
+
+### 3. Empate → hard-PR (no se actualiza)
+
+Si el set candidato iguala el valor del PR existente, **no** se actualiza nada (`achieved_at`, `set_id`, `weight_kg`, `reps` se mantienen). Razón: el PR es "la primera vez que lograste X". Reescribir el `achieved_at` cuando alguien vuelve a hacer la misma marca borraría la fecha original — no aporta info al alumno.
+
+El comportamiento se garantiza con un `WHERE` estricto en el `DO UPDATE` (`<`, no `<=`). En SQL:
+
+```sql
+ON CONFLICT (tenant_id, student_id, exercise_id, record_type)
+DO UPDATE SET
+  weight_kg = EXCLUDED.weight_kg,
+  reps = EXCLUDED.reps,
+  set_id = EXCLUDED.set_id,
+  achieved_at = EXCLUDED.achieved_at
+WHERE personal_records.<metric> < EXCLUDED.<metric>
+```
+
+`<metric>` es:
+
+- `weight_kg` para `max_weight`,
+- `reps` para `max_reps_at_weight`,
+- `(weight_kg * reps)` para `max_volume`.
+
+### 4. Concurrencia: UPSERT con `ON CONFLICT … DO UPDATE … WHERE` (sin advisory lock)
+
+El roadmap exigía un test de concurrencia: dos `POST /sets` simultáneos que apunten al mismo `(student, exercise)` no deben corromper el PR. Opciones consideradas:
+
+1. **Advisory lock por `(student_id, exercise_id)`** (`pg_advisory_xact_lock`): serializa la sección crítica completa. Funciona pero agrega round-trips.
+2. **Isolation REPEATABLE READ + recompute**: cierra la ventana pero falla con `40001 serialization_failure` bajo carga, obligando a retry.
+3. **`INSERT … ON CONFLICT (UNIQUE_KEY) DO UPDATE … WHERE`**: Postgres serializa el conflict resolution con row lock sobre el índice único. Atomic, sin recompute, sin retry. **Elegido.**
+
+Cada UPSERT funciona en dos escenarios:
+
+- **Sin PR previo** → el `INSERT` crea la fila. El `WHERE` del `DO UPDATE` no aplica.
+- **Con PR previo** → Postgres detecta el conflict, toma row lock, evalúa el `WHERE`. Si el candidato es mejor estricto, actualiza; si no, no toca el row. La transacción que pierde la carrera lee el row ya actualizado, y su `WHERE` falla porque su candidato no supera al nuevo PR.
+
+Con dos transacciones concurrentes A (`weight_kg=100`) y B (`weight_kg=120`):
+
+- Si A llega primero, inserta `100`. B detecta conflict, evalúa `100 < 120`, gana → row final `120`.
+- Si B llega primero, inserta `120`. A detecta conflict, evalúa `120 < 100`, no actualiza → row final `120`.
+
+En ambos órdenes la convergencia es la misma. El E2E `personal-records.e2e-spec.ts` lo valida con `Promise.all([postSet(A), postSet(B)])` sobre 2 routine_items del mismo exercise.
+
+**Riesgo**: el cálculo emite 3 UPSERTs por set (uno por record_type). Para una sesión con 30 sets eso son 90 INSERTs sobre `personal_records`, la gran mayoría no-ops (no superan el PR). Costo aceptable para el read-amplification que se evita (el GET de PRs es 1 query indexada). Si en el futuro pesa, se evalúa batchear los 3 con un `WITH … INSERT` o filtrar antes del UPSERT.
+
+### 5. Jerarquía de lectura: OWNER all, TRAINER suyos, STUDENT self
+
+Reutiliza la misma política que sessions/assignments:
+
+- `OWNER` ve cualquier student del tenant.
+- `TRAINER` ve sólo students con `student.trainerId === actor.userId`.
+- `STUDENT` sólo `self` (`actor.userId === student.id`).
+
+Caso negativo dispara **403 `FORBIDDEN_ROLE_HIERARCHY`** (no 404 — el student existe, lo que falta es autorización). Misma decisión que en `AssignmentsService.listForStudent`.
+
+`studentId` que no existe en el tenant o que apunta a un user con `role !== 'STUDENT'` → **404 `STUDENT_NOT_FOUND`** (no se filtra existencia cross-tenant, alineado con ADR-018/020/025).
+
+### 6. Sets bodyweight (`weightKg = null`) se skipean del cálculo
+
+`personal_records.weight_kg` es `NOT NULL`. Sets con `weight_kg=null` (bodyweight: dominadas, sentadillas sin barra) **no producen PR**. El service devuelve early sin emitir los 3 UPSERTs.
+
+Alternativas descartadas:
+
+- **Permitir `personal_records.weight_kg = NULL`**: rompe la suposición de "el PR es comparable numéricamente" — `max_weight` para un set bodyweight es siempre `NULL`, y el WHERE estricto contra `NULL` da `NULL` (ni true ni false), nunca actualiza. Habría que reescribir la lógica con `COALESCE(weight_kg, 0)` y deja de ser intuitivo.
+- **Tratar `NULL` como `0`**: equivale a "el PR de dominadas es siempre 0kg × N reps", lo cual es útil sólo para `max_reps_at_weight`. Para `max_weight` y `max_volume` queda trivialmente 0 — pollutes la tabla con rows inútiles.
+
+Si más adelante queremos PR para bodyweight, se modela aparte: un `record_type` nuevo (`max_reps_bodyweight`) o una tabla separada. Diferido hasta que aparezca el caso.
+
+`weightKg = 0` (no NULL — un "deload extremo" con barra vacía) **sí** dispara los 3 UPSERTs: 0 es un peso válido, comparable. El comportamiento se chequea en `personal-records.service.spec.ts`.
+
+### 7. FK `personal_records.set_id` → `sets.id` con `ON DELETE RESTRICT`
+
+Protege la evidencia: no se puede borrar el set que fundó el PR sin antes limpiar la fila de `personal_records`. Si en algún momento se borra una `session` (hoy no se hace), la cadena `sessions → sets` con `CASCADE` no llega hasta acá porque `personal_records.set_id` es RESTRICT.
+
+Si en el futuro se quiere borrar una sesión + recomputar PRs, hace falta un job explícito: limpiar `personal_records` para `(student_id, exercise_id)` afectados + recalcular del `sets` restante. No hay endpoint hoy.
+
+Alternativas descartadas:
+
+- **`SET NULL`**: el PR queda apuntando a `set_id IS NULL` — válido pero pierde la trazabilidad. Si más adelante el cliente quiere mostrar "el set en el que lograste el PR" se rompe.
+- **`CASCADE`**: borrar el set borra el PR. Aparentemente cómodo, pero abre un agujero: borrar accidentalmente un set hace desaparecer un PR ganado, sin recompute. Demasiado destructivo para algo material.
+
+### 8. Tabla de codes nuevos
+
+Documentada en `docs/05-api-conventions.md`:
+
+- **404 `STUDENT_NOT_FOUND`** (reuso del code del módulo assignments, mismo concepto cross-tenant/no-existe/no-STUDENT).
+- **403 `FORBIDDEN_ROLE_HIERARCHY`** (reuso del code transversal).
+
+No se agregan codes nuevos: la semántica de PRs no introduce errores de negocio propios (no hay "PR duplicado", "PR inválido", etc. — el cálculo es deterministico).
+
+**Consecuencias**:
+
+- `SessionsService` ahora depende de `PersonalRecordsModule` (`exports: [PersonalRecordsService]`). Cycle-safe porque `PersonalRecordsModule` no importa nada de sessions/assignments — sólo expone el service que llama a `manager.query`.
+- La transacción de `addSet` ahora incluye 3 UPSERTs adicionales por set (sin contar lookups). Latencia esperada de un POST /sets: +3-5 ms en local. Aceptable.
+- El frontend del STUDENT (Step 27) consume `/students/:id/personal-records` para mostrar PRs por exercise; el frontend del TRAINER (Step 25 / fase 2) lo usa para reports.
+- **Riesgo**: si el cliente reintenta un POST /sets idempotentemente (mismo body, distinto setNumber por accidente), genera múltiples sets que pueden producir múltiples evaluaciones de PR. El strict `<` mantiene el PR estable, pero la tabla `sets` se infla. El control de idempotencia vive aguas arriba (`setNumber` único por `(session, routine_item)` ya validado en Step 18).
+- **Riesgo**: el nombre `max_reps_at_weight` del enum no refleja exactamente la semántica simplificada del MVP (es "max reps en un set", no "max reps a un peso específico"). Renombrar implicaría un `ALTER TYPE` con downtime; preferimos vivir con el desalineamiento de naming hasta que aparezca un cambio mayor de semántica que justifique migración.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)

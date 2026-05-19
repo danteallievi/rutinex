@@ -10,6 +10,7 @@ import { DataSource } from 'typeorm';
 import type { AuthenticatedUser } from '../auth/jwt-payload';
 import { Assignment } from '../assignments/entities/assignment.entity';
 import { Exercise } from '../exercises/entities/exercise.entity';
+import { PersonalRecordsService } from '../personal-records/personal-records.service';
 import { RoutineItem } from '../routines/entities/routine-item.entity';
 import { Routine } from '../routines/entities/routine.entity';
 import { User } from '../users/entities/user.entity';
@@ -252,6 +253,12 @@ describe('SessionsService', () => {
         SessionsService,
         { provide: SessionsRepository, useValue: sessionsRepo },
         { provide: DataSource, useValue: buildDataSource() },
+        {
+          provide: PersonalRecordsService,
+          useValue: {
+            computeAndUpsertForSet: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     }).compile();
     service = module.get<SessionsService>(SessionsService);

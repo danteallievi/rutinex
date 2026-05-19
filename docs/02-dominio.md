@@ -180,17 +180,21 @@ Una sesión es la ejecución de una rutina asignada en una fecha.
 
 Derivable de `sets` pero materializado para queries baratas.
 
-| Campo         | Tipo         | Notas                                             |
-| ------------- | ------------ | ------------------------------------------------- |
-| `id`          | uuid PK      |                                                   |
-| `tenant_id`   | uuid FK      |                                                   |
-| `student_id`  | uuid FK      |                                                   |
-| `exercise_id` | uuid FK      | UNIQUE con `student_id` + `record_type`.          |
-| `record_type` | enum         | `max_weight`, `max_reps_at_weight`, `max_volume`. |
-| `weight_kg`   | numeric(6,2) |                                                   |
-| `reps`        | int          |                                                   |
-| `achieved_at` | timestamptz  |                                                   |
-| `set_id`      | uuid FK      | Set en el que se logró.                           |
+| Campo         | Tipo         | Notas                                                                                                          |
+| ------------- | ------------ | -------------------------------------------------------------------------------------------------------------- |
+| `id`          | uuid PK      |                                                                                                                |
+| `tenant_id`   | uuid FK      | FK RESTRICT a `tenants`.                                                                                       |
+| `student_id`  | uuid FK      | FK RESTRICT a `users`.                                                                                         |
+| `exercise_id` | uuid FK      | FK RESTRICT a `exercises`.                                                                                     |
+| `record_type` | enum         | `max_weight`, `max_reps_at_weight`, `max_volume`.                                                              |
+| `weight_kg`   | numeric(6,2) | NOT NULL. Sets con `weight_kg=null` (bodyweight) se **skipean** del cálculo en MVP (ADR-027 §3).               |
+| `reps`        | int          |                                                                                                                |
+| `achieved_at` | timestamptz  | `now()` al insertar/actualizar el row. Hard-PR: no se actualiza en empate (ADR-027 §3).                        |
+| `set_id`      | uuid FK      | Set en el que se logró. FK RESTRICT a `sets` — protege la evidencia del PR (no se puede borrar el set fuente). |
+
+**Constraints e índices**:
+
+- `UNIQUE (tenant_id, student_id, exercise_id, record_type)` (`uq_personal_records_target`, ADR-027 §4) — pivote del UPSERT atómico `ON CONFLICT … DO UPDATE … WHERE EXCLUDED > pr`. Resuelve la concurrencia de POSTs de sets simultáneos sin advisory locks ni REPEATABLE READ.
 
 ### `comments`
 
@@ -278,7 +282,7 @@ personal_records >── exercises, sets
 3. Toca "Comenzar" → `POST /sessions { assignmentId }`. El service valida que el assignment esté `active` (no se requiere matchear weekday — el STUDENT puede ejecutar al día siguiente; ADR-026 §5). 1 sesión abierta por asignación (UNIQUE parcial); si ya hay una, el flow reanuda con el `openSessionId` devuelto en `today`.
 4. Por cada ejercicio del snapshot, ve título/descripción/media. Carga reps + peso por set vía `POST /sessions/:id/sets { routineItemId, setNumber, reps, weightKg? }`. El service valida que `routineItemId` esté en el snapshot (no en la tabla viva) y que el `setNumber` sea único por `(session, routine_item)`.
 5. Al terminar, `POST /sessions/:id/complete` setea `completed_at`. La sesión queda inmutable (más sets o re-complete → 400 `SESSION_ALREADY_COMPLETED`).
-6. Background (o on-the-fly): si algún set supera el PR previo del alumno en ese ejercicio, se upserta en `personal_records` (Step 19, todavía no implementado).
+6. Dentro de la misma transacción que el `POST /sessions/:id/sets`, si el set supera el PR previo del alumno en ese ejercicio, se upserta en `personal_records` con `ON CONFLICT … DO UPDATE … WHERE EXCLUDED > pr`. Sets con `weight_kg=null` (bodyweight) se skipean del cálculo (Step 19 / ADR-027).
 
 ### F6 — Prender/apagar STUDENT
 
