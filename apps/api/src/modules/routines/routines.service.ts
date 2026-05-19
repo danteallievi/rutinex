@@ -1,9 +1,10 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, In, Repository } from 'typeorm';
+import { DataSource, In, QueryFailedError, Repository } from 'typeorm';
 
 import { Exercise } from '../exercises/entities/exercise.entity';
 import type { CreateRoutineDto } from './dto/create-routine.dto';
@@ -199,9 +200,24 @@ export class RoutinesService {
   }
 
   async remove(tenantId: string, id: string): Promise<void> {
-    const result = await this.routinesRepository.delete({ tenantId, id });
-    if (result.affected === 0) {
-      throw this.notFound(id);
+    try {
+      const result = await this.routinesRepository.delete({ tenantId, id });
+      if (result.affected === 0) {
+        throw this.notFound(id);
+      }
+    } catch (err) {
+      // Si la rutina está referenciada por assignments (FK RESTRICT,
+      // Step 17 / ADR-025), Postgres tira 23503. Traducimos a 409 con
+      // `ROUTINE_HAS_ASSIGNMENTS` — el frontend pide al user que borre
+      // las asignaciones primero.
+      if (isForeignKeyViolation(err, 'fk_assignments_routine')) {
+        throw new ConflictException({
+          code: 'ROUTINE_HAS_ASSIGNMENTS',
+          message:
+            'No se puede borrar la rutina: tiene asignaciones activas. Borrá las asignaciones primero.',
+        });
+      }
+      throw err;
     }
   }
 
@@ -323,4 +339,18 @@ export class RoutinesService {
       message: `Routine "${id}" no encontrada.`,
     });
   }
+}
+
+/**
+ * `true` si el error es un `QueryFailedError` por violación de FK (Postgres
+ * SQLSTATE 23503) y el constraint mencionado matchea `constraintName`.
+ * Match exacto por nombre — alcanza con `includes` porque PG mete el nombre
+ * literal en el mensaje del driverError (`update or delete on table "X"
+ * violates foreign key constraint "fk_assignments_routine" on table "Y"`).
+ */
+function isForeignKeyViolation(err: unknown, constraintName: string): boolean {
+  if (!(err instanceof QueryFailedError)) return false;
+  const driverError = (err as { driverError?: { code?: string } }).driverError;
+  if (driverError?.code !== '23503') return false;
+  return err.message.includes(constraintName);
 }

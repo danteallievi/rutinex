@@ -7,6 +7,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { getDataSourceOptions } from './config/database';
+import { AssignmentsModule } from './modules/assignments/assignments.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ExercisesModule } from './modules/exercises/exercises.module';
 import { MediaModule } from './modules/media/media.module';
@@ -28,6 +29,7 @@ import { UsersModule } from './modules/users/users.module';
     ExercisesModule,
     MediaModule,
     RoutinesModule,
+    AssignmentsModule,
   ],
   controllers: [AppController],
   providers: [

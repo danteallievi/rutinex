@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 16 completo. Próximo: Step 17 — Asignación de rutina a alumno.
-**Última actualización**: 2026-05-18 — Step 16 (CRUD Routines + RoutineItems + ADR-024).
+**Paso actual**: Step 17 completo. Próximo: Step 18 — Sesión + tracking de sets.
+**Última actualización**: 2026-05-18 — Step 17 (Assignments + ADR-025).
 
 ## Cambios de doc
 
@@ -788,9 +788,69 @@ Notas:
 - El FK `routine_items.routine_id` es `ON DELETE CASCADE`: borrar una rutina arrastra sus items sin necesidad de transacción manual en el service. El FK `routine_items.exercise_id` es `RESTRICT` — no se puede borrar un exercise mientras alguna rutina lo referencia (ADR-022 ya impide eso a nivel API; el constraint cierra el gap por SQL directo).
 - `RoutinesService.update` toca `updatedAt` manualmente cuando reemplaza items, porque el `@UpdateDateColumn` de `Routine` no se dispara por delete/insert de la tabla hija. Sin el `update({ id }, { updatedAt: new Date() })`, el `updatedAt` quedaba con el valor previo aunque el contenido cambió.
 
+### Step 17 — Asignación de rutina a alumno (2026-05-18)
+
+Entity `Assignment` + tres endpoints (`POST /routines/:id/assignments`, `GET /students/:id/assignments`, `DELETE /assignments/:id`) sin PATCH. Inmutable: para cambiar fechas/weekdayMask se borra y re-crea. Decisiones cristalizadas en **ADR-025** (weekdayMask int bitmask, sin PATCH, status calculado, jerarquía trainer→student, FK RESTRICT a routines).
+
+**Entity + migración**: `Assignment` en `apps/api/src/modules/assignments/entities/assignment.entity.ts` con `id`, `tenantId` (uuid + FK RESTRICT a `tenants`), `routineId` (uuid + FK RESTRICT a `routines`), `studentId` (uuid + FK RESTRICT a `users`), `assignedBy` (uuid + FK RESTRICT a `users`), `startsOn` (date), `endsOn` (date nullable), `weekdayMask` (int — bit 0=Dom … bit 6=Sáb, alineado con `docs/02-dominio.md`), `createdAt`. Sin `updatedAt`. Índices: `ix_assignments_tenant_id`, `ix_assignments_routine_id`, `ix_assignments_student_id`, `ix_assignments_assigned_by`. Sin UNIQUE compuesto — se permite re-asignar la misma rutina al mismo alumno con `starts_on` distinto.
+
+Migración `apps/api/src/migrations/1779440000000-InitAssignments.ts` a mano (mismo patrón que `InitRoutines`). FKs nombrados explícito (`fk_assignments_tenant`, `fk_assignments_routine`, `fk_assignments_student`, `fk_assignments_assigned_by`) — el nombre se usa para matchear el 23503 de Postgres en `RoutinesService.remove`. Up/down testeados; drift check con `migration:generate` no encuentra cambios.
+
+**`AssignmentsRepository`** (`assignments.repository.ts`): extiende `TenantScopedRepository<Assignment>`, mismo patrón que `RoutinesRepository`.
+
+**`AssignmentsService`** (`assignments.service.ts`):
+
+- `createForRoutine(tenantId, actor, routineId, dto)`: valida `endsOn >= startsOn` pre-lookup; busca routine y student tenant-scoped (404 si no); valida `student.role === 'STUDENT'` (400 `ASSIGNMENT_INVALID_STUDENT`); aplica jerarquía (TRAINER sólo a su propio STUDENT, 403 `FORBIDDEN_ROLE_HIERARCHY`); inserta con `assignedBy = actor.userId` y devuelve `AssignmentResponse` con `status` calculado.
+- `listForStudent(tenantId, actor, studentId, query)`: busca student tenant-scoped (404 si no o si `role !== STUDENT`); aplica jerarquía de lectura (TRAINER sólo sus STUDENTs, STUDENT sólo self); `find` por `(tenantId, studentId)` ordenado por `startsOn DESC, createdAt DESC`; mapea a response con `status` y filtra en memoria si `query.status` está en `active|expired|future` (default `all`).
+- `removeByActor(tenantId, actor, id)`: lookup tenant-scoped (404 si no); si actor=TRAINER, lookup del student para chequear `trainerId === actor.userId` (403 si no); hard delete por `(tenantId, id)`.
+
+**Status calculado** (`dto/assignment.response.ts`): `computeAssignmentStatus(startsOn, endsOn, today)` devuelve `future|expired|active`. `todayDateString(now)` arma `YYYY-MM-DD` en UTC para alinear con la columna `date` de Postgres (sin timezone). `toAssignmentResponse(a, today?)` arma la response completa con `id`, `routineId`, `studentId`, `assignedBy`, `startsOn`, `endsOn`, `weekdayMask`, `status`, `createdAt`.
+
+**`AssignmentsController`** (`assignments.controller.ts`):
+
+- `@Controller()` sin prefix — tres handlers con paths absolutos distintos.
+- `POST /routines/:id/assignments` (`@Roles('OWNER','TRAINER')`).
+- `GET /students/:id/assignments` (sin `@Roles` — STUDENT puede leer lo suyo, gate fino vive en service por jerarquía; mismo patrón ADR-019 que `GET /routines`).
+- `DELETE /assignments/:id` (`@Roles('OWNER','TRAINER')`).
+
+**DTOs**:
+
+- `CreateAssignmentDto`: `studentId` (UUID), `startsOn` (`@IsISO8601 strict`), `endsOn?` (`@IsISO8601 strict`, acepta `null`), `weekdayMask` (int 1-127). `0` se rechaza por `@Min(1)` — sin code custom porque la validación del class-validator basta.
+- `ListAssignmentsQueryDto`: `status?` ∈ `'active'|'expired'|'future'|'all'`. Sin paginación.
+
+**Cross-cutting: `RoutinesService.remove` captura 23503**: se importa `QueryFailedError` de TypeORM y se chequea `driverError.code === '23503'` + match del nombre del constraint (`fk_assignments_routine`). Si matchea, se tira `ConflictException` con `code: 'ROUTINE_HAS_ASSIGNMENTS'` (409). Cualquier otro error se re-tira sin tocar. Helper `isForeignKeyViolation(err, constraintName)` extraído al pie del archivo — reusable cuando aparezcan más FKs RESTRICT que hagan falta traducir a `code` parseable.
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- **409 `ROUTINE_HAS_ASSIGNMENTS`** (módulo routines, cross-cutting).
+- **404 `ASSIGNMENT_NOT_FOUND`** (DELETE inexistente).
+- **404 `STUDENT_NOT_FOUND`** (POST/GET con id inexistente o que no apunta a `role=STUDENT`).
+- **400 `ASSIGNMENT_INVALID_STUDENT`** (POST con `studentId` que apunta a un TRAINER/OWNER).
+- **400 `ASSIGNMENT_INVALID_DATE_RANGE`** (POST con `endsOn < startsOn`).
+
+Reuso: `FORBIDDEN_ROLE` del Step 11 (RolesGuard), `FORBIDDEN_ROLE_HIERARCHY` del Step 12 (UsersService, ADR-020), `ROUTINE_NOT_FOUND` del Step 16, `TENANT_SLUG_REQUIRED`/`TENANT_MISMATCH` del Step 10.
+
+**Tests**:
+
+- Unit (`assignments.service.spec.ts`, 20 cases): createForRoutine (OWNER OK, TRAINER a su STUDENT OK, TRAINER cross 403, routine 404, student 404, student no-STUDENT 400, endsOn<startsOn 400, endsOn===startsOn OK), listForStudent (OWNER OK, TRAINER OK, TRAINER cross 403, STUDENT self OK, STUDENT cross 403, no-STUDENT 404, filter status=active con fake timer, filter status=expired), removeByActor (OWNER OK sin chequear users, TRAINER su student OK, TRAINER cross 403, 404).
+- E2E (`assignments.e2e-spec.ts`, 31 cases): cubre los 3 endpoints + el cross-cutting de `DELETE /routines`. Fixture multi-actor (ownerA, trainerA, trainerA2, studentA1=del trainerA, studentA2=del trainerA2, ownerB, studentB). POST (OWNER OK, TRAINER su student OK, TRAINER cross 403, STUDENT 403, routine 404, routine cross-tenant 404, student cross-tenant 404, student=TRAINER 400, endsOn<startsOn 400, weekdayMask=0 400, weekdayMask=128 400, startsOn no-ISO 400, no-whitelisted 400, sin bearer 401). GET (OWNER OK, TRAINER OK, TRAINER cross 403, STUDENT self OK, STUDENT cross 403, no-STUDENT 404, cross-tenant 404, filter status=active/expired/future con seeding de fechas relativas a today UTC, status inválido 400). DELETE (OWNER OK, TRAINER su student OK, TRAINER cross 403, STUDENT 403, 404, cross-tenant 404). Cross-cutting (DELETE /routines con assignments → 409, después de borrar assignments → 204).
+
+**Wiring**: `AssignmentsModule` registra controller + service + `AssignmentsRepository` y declara `TypeOrmModule.forFeature([Assignment])`. `AppModule` lo importa después de `RoutinesModule`. No depende de `RoutinesModule` ni `UsersModule` — usa `dataSource.getRepository(Routine|User)` directo para lookups (mismo patrón que `SuperadminTenantsService` y `RoutinesService`).
+
+Verificación: `pnpm lint` clean. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 272/272 (252 previos del Step 16 + 20 nuevos en assignments-service). `pnpm --filter @rutinex/api test:e2e` 246/246 (215 previos + 31 nuevos en assignments.e2e-spec.ts).
+
+Archivos clave: `apps/api/src/modules/assignments/{assignments.module,assignments.controller,assignments.service,assignments.service.spec,assignments.repository}.ts`, `apps/api/src/modules/assignments/entities/assignment.entity.ts`, `apps/api/src/modules/assignments/dto/{create-assignment.dto,list-assignments.query.dto,assignment.response}.ts`, `apps/api/src/migrations/1779440000000-InitAssignments.ts`, `apps/api/src/modules/routines/routines.service.ts` (captura del 23503 + `isForeignKeyViolation` helper), `apps/api/src/app.module.ts` (import del módulo), `apps/api/test/assignments.e2e-spec.ts`, `docs/05-api-conventions.md` (tabla de codes), `docs/08-decisiones.md` (ADR-025).
+
+Notas:
+
+- El `weekdayMask` no aparece como columna en la pantalla del student todavía (Step 26+). Cuando llegue, el frontend tiene que mapear bits a días localizados — el orden canon en el doc es bit 0=Dom, …, bit 6=Sáb (alineado con `Date.prototype.getDay()`).
+- `STUDENT_NOT_FOUND` se eligió como code separado de `USER_NOT_FOUND` porque el contexto del endpoint (`/students/:id/...`) hace explícito que el target debe ser un STUDENT. Si el id apunta a un user existente con role TRAINER, devolvemos 404 con este code — no 400 — porque desde el punto de vista de la ruta, ese id "no es un student".
+- El test de filter status=active usa `Date` actual del runtime (no fake timer) y seedea fechas relativas (today, 1999, 2099). Mantiene el spec robusto si lo corremos en cualquier momento — el límite real está en que el año 2099 deja de ser futuro algún día, pero será otro problema.
+- `RoutinesService.remove` ahora tiene un try/catch — la única forma de cambiar el comportamiento del happy path es si Postgres tira un 23503 con un constraint distinto a `fk_assignments_routine`, caso que no se da hoy. Si más adelante aparece otra FK RESTRICT que apunte a `routines` (e.g. desde `sessions` en Step 18), se agrega un branch al chequeo.
+
 ## Próxima acción concreta
 
-Step 17 — Asignación de rutina a alumno. Entity `Assignment` + migración (FK a `routines` y `users.STUDENT`, `assigned_by`, `starts_on`, `ends_on?`, `weekday_mask`), endpoints `POST /routines/:id/assignments`, `GET /students/:id/assignments`, `DELETE /assignments/:id`. Ver criterios completos en `docs/07-roadmap.md` → Step 17.
+Step 18 — Sesión + tracking de sets. Entities `Session` (con `routine_snapshot` jsonb, `assignment_id`, `started_at`, `completed_at?`) y `Set` (con `session_id`, `routine_item_id`, `exercise_id` y `student_id` denormalizados, `set_number`, `reps`, `weight_kg?`). Endpoints: `POST /sessions` (arranca, snapshotea), `POST /sessions/:id/sets`, `POST /sessions/:id/complete`. Ver criterios completos en `docs/07-roadmap.md` → Step 18. Acá se cristaliza la inmutabilidad post-asignación de routines (ADR-024 sección 6) — decidir si `sessions.routine_id` es FK RESTRICT o si guardamos sólo el snapshot.
 
 ## Pendientes / deudas técnicas
 

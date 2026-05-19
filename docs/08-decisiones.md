@@ -959,4 +959,93 @@ Por qué partir la forma:
 
 ---
 
+## ADR-025 — Assignments: int bitmask, sin PATCH, jerarquía trainer→student, FK RESTRICT a routines
+
+**Contexto**: el Step 17 introduce `assignments` — vínculo entre una `routine` y un `STUDENT` con `starts_on`, `ends_on?`, `weekday_mask`. El roadmap pide `POST /routines/:id/assignments`, `GET /students/:id/assignments`, `DELETE /assignments/:id`, y deja explícito que "trainer no puede asignar a alumno de otro trainer (a evaluar)". Vamos a clavar acá la política de jerarquía y un puñado de sub-decisiones de shape antes de que Step 18 (`sessions`) se construya encima.
+
+**Decisiones**:
+
+### 1. `weekday_mask` como `int` (bitmask) en API y DB
+
+`docs/02-dominio.md` define `weekday_mask` como `int` con bit 0 = Domingo, … bit 6 = Sábado. Se mantiene tanto en la columna (`integer NOT NULL`) como en el wire (`weekdayMask: number`). El frontend convierte a un grupo de 7 checkboxes — la conversión vive en el cliente, no en el API.
+
+Alternativa descartada: array de strings (`['MON','WED','FRI']`). Más amigable como contrato pero requiere mapping bidireccional + decidir orden canon + ampliar el DTO. El caso real es una UI sencilla — el bitmask es ergonómico para el browser (`mask & (1 << dayOfWeek())`) y tiene un único representante por estado. Si más adelante necesitamos exponer el shape array por una integración externa, se agrega un response auxiliar.
+
+Validación: `@IsInt() @Min(1) @Max(127)`. `0` se rechaza con 400 genérico (asignación sin días no se ejecuta nunca). `>127` se rechaza por el mismo lado (sólo 7 bits válidos). Sin chequeo extra de "al menos un bit" en el service — `Min(1)` ya lo cubre.
+
+### 2. Sin PATCH: assignment es inmutable
+
+Sólo `POST/GET/DELETE`. Para cambiar `starts_on`, `ends_on` o `weekday_mask` el caller borra y re-crea. Razones:
+
+- El roadmap no pide PATCH.
+- Una asignación es un evento puntual (fecha de creación + ventana) — semánticamente más cerca de "agregar a la agenda" que de "editar un documento".
+- Step 18 va a meter `sessions.assignment_id` (la sesión recuerda bajo qué assignment se ejecutó). Si permitiéramos editar `starts_on` retroactivamente, una sesión vieja podría apuntar a una asignación cuyo rango ya no la incluye. Hard delete + re-create deja las sesiones viejas con `assignment_id` apuntando a una asignación borrada (RESTRICT en `sessions` lo va a bloquear cuando exista) — el caller maneja esa fricción explícitamente.
+
+Si más adelante aparece "rangos rotantes" o "ajustes diarios", se evalúa PATCH parcial; hoy es prematuro.
+
+### 3. `status` calculado en response, no persistido
+
+Cada `AssignmentResponse` lleva `status: 'active' | 'expired' | 'future'` derivado de `(startsOn, endsOn, today)`:
+
+- `future` → `startsOn > today`
+- `expired` → `endsOn !== null AND endsOn < today`
+- `active` → resto
+
+Se calcula en el service al armar la response (mismo `today` para toda la lista, evita inconsistencias por borde del día). No se persiste en DB — sería redundante con `(starts_on, ends_on)` y obligaría a un job que mueva filas de `active` a `expired` a las 00:00.
+
+El query param `?status=active|expired|future|all` filtra en memoria después de leer todo. Costo: O(rows-del-student). Aceptable porque un alumno realista acumula decenas de assignments. Si llega a miles, se sube el filtro a SQL.
+
+Sin paginación en `GET /students/:id/assignments` por la misma razón: el universo es chico. Si aparece presión, se agrega `limit`/`cursor` sin breaking change.
+
+### 4. Jerarquía trainer→student aplicada en service (no en guards)
+
+El roadmap deja la decisión abierta. Se restringe:
+
+- **POST**: OWNER puede asignar a cualquier STUDENT del tenant. TRAINER sólo si `student.trainerId === actor.userId`. STUDENT cortado por `@Roles('OWNER','TRAINER')` antes de llegar al service.
+- **GET**: OWNER ve cualquier STUDENT. TRAINER sólo sus STUDENTs. STUDENT sólo lo suyo (`id === actor.userId`).
+- **DELETE**: OWNER cualquiera. TRAINER sólo si el `student.trainerId === actor.userId` (no exige `assigned_by === actor` — un OWNER que asignó y después delega al TRAINER, el TRAINER puede limpiar).
+
+403 con `code: 'FORBIDDEN_ROLE_HIERARCHY'` (reuso del code del Step 12, ADR-020). Mismo patrón que `UsersService.updateForActor`: la jerarquía depende de la combinación (actor, target, action), no cabe en un `@Roles(...)`.
+
+Alternativa descartada (cross-trainer libre): viola el modelo del dominio (`STUDENT.trainerId` es propietario explícito, ver `docs/02-dominio.md`) y abre la puerta a que un TRAINER pise el plan de otro. En MVP con 2-3 trainers por tenant es ruido directo.
+
+### 5. FKs RESTRICT en todos los lados; routine ya no es libre de borrar
+
+`assignments` lleva 4 FKs: `tenant_id`, `routine_id`, `student_id`, `assigned_by`. Todos **RESTRICT**:
+
+- `routine_id`: borrar una routine con assignments tira 23503 en Postgres. El `RoutinesService.remove` lo captura y devuelve **409 `ROUTINE_HAS_ASSIGNMENTS`**. El frontend pide al user que borre las asignaciones primero (analogía: no se puede borrar un exercise referenciado por routines, ADR-022 + el RESTRICT del Step 16). Consistente con el patrón general.
+- `student_id` / `assigned_by`: borrar un user con assignments hoy es no-op (los users no se borran hard en MVP — Step 12 los desactiva con `isActive=false`). El RESTRICT cubre el caso defensivo si en el futuro hay un `removeHard`.
+- `tenant_id`: RESTRICT estándar (no se borran tenants).
+
+Alternativa descartada en `routine_id` (CASCADE): borrar una routine arrastraría asignaciones silenciosamente. Una UI de admin sin confirmación granular podría dejar al alumno "desplanado" sin warning explícito. RESTRICT obliga al caller a manejar las dependencias en el orden correcto, alineado con el principio de "operaciones destructivas requieren intención explícita".
+
+### 6. Sin UNIQUE compuesto (un alumno puede recibir la misma rutina varias veces)
+
+`(student_id, routine_id, starts_on)` _no_ tiene UNIQUE. Razones:
+
+- Un alumno puede recibir la misma rutina con distintos rangos (e.g. "tren superior" de marzo, otra vez en julio). Bloquearlo agrega fricción sin mejorar la integridad.
+- El UNIQUE forzaría a cambiar `starts_on` aunque el caller quisiera duplicar deliberadamente.
+- El frontend muestra el listado completo — el duplicado, si ocurre, es visible.
+
+Si aparece el caso "duplicado accidental al mash-clickear" lo manejamos con un confirm UX, no con un constraint.
+
+### 7. Códigos de error nuevos
+
+- **404 `ASSIGNMENT_NOT_FOUND`**: `DELETE /assignments/:id` con id inexistente en el tenant del JWT. Cross-tenant también devuelve 404 (no se filtra existencia).
+- **404 `STUDENT_NOT_FOUND`**: `POST /routines/:id/assignments` con `studentId` inexistente; `GET /students/:id/assignments` con id inexistente o que no apunta a un user `role=STUDENT`. Code separado de `USER_NOT_FOUND` para dar señal semántica más concreta al frontend (el endpoint vive en el contexto de students).
+- **400 `ASSIGNMENT_INVALID_STUDENT`**: `POST /routines/:id/assignments` con `studentId` que existe pero apunta a un user que **no** tiene `role=STUDENT` (TRAINER/OWNER por error).
+- **400 `ASSIGNMENT_INVALID_DATE_RANGE`**: `endsOn < startsOn`. Validación a nivel service (el DTO no compara dos campos).
+- **409 `ROUTINE_HAS_ASSIGNMENTS`**: `DELETE /routines/:id` cuando la routine tiene assignments. Captura del 23503 de Postgres con match por nombre de constraint (`fk_assignments_routine`).
+
+`FORBIDDEN_ROLE_HIERARCHY` se reusa del Step 12 (ADR-020); ver tabla en `docs/05-api-conventions.md`.
+
+**Consecuencias**:
+
+- `AssignmentsController` declara paths absolutos por handler (`@Controller()` sin prefix). Tres handlers con rutas distintas — el patrón existe en NestJS y es el camino limpio cuando no hay prefix común. Si más adelante crecen los endpoints de un mismo recurso, se evalúa partirlo en controllers separados.
+- El frontend (Step 25) tiene que mostrar el `status` calculado tal cual viene del API — no recalcularlo en JS para evitar drift por timezone del cliente.
+- El borrado de routines pasa de "siempre 204" a "204 ó 409 según haya assignments". El frontend (Step 24) tiene que manejar el 409 con un mensaje accionable.
+- Step 18 (sessions) hereda este shape: `Session.assignment_id` con FK RESTRICT, y la inmutabilidad post-creación del assignment hace que la trazabilidad sea limpia.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)
