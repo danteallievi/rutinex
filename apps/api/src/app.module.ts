@@ -12,6 +12,7 @@ import { AuthModule } from './modules/auth/auth.module';
 import { ExercisesModule } from './modules/exercises/exercises.module';
 import { MediaModule } from './modules/media/media.module';
 import { RoutinesModule } from './modules/routines/routines.module';
+import { SessionsModule } from './modules/sessions/sessions.module';
 import { SuperadminModule } from './modules/superadmin/superadmin.module';
 import { TenantsModule } from './modules/tenants/tenants.module';
 import { UsersModule } from './modules/users/users.module';
@@ -30,6 +31,7 @@ import { UsersModule } from './modules/users/users.module';
     MediaModule,
     RoutinesModule,
     AssignmentsModule,
+    SessionsModule,
   ],
   controllers: [AppController],
   providers: [

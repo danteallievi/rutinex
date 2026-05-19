@@ -217,6 +217,15 @@ export class RoutinesService {
             'No se puede borrar la rutina: tiene asignaciones activas. Borrá las asignaciones primero.',
         });
       }
+      // Step 18 / ADR-026: sessions.routine_id es FK RESTRICT (snapshot +
+      // FK al routine vivo). Sesiones ejecutadas bloquean el delete.
+      if (isForeignKeyViolation(err, 'fk_sessions_routine')) {
+        throw new ConflictException({
+          code: 'ROUTINE_HAS_SESSIONS',
+          message:
+            'No se puede borrar la rutina: tiene sesiones ejecutadas. Las sesiones quedan en la historia del alumno y la rutina debe persistir mientras existan.',
+        });
+      }
       throw err;
     }
   }

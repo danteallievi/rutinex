@@ -1,10 +1,11 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, QueryFailedError } from 'typeorm';
 import type { FindOptionsWhere } from 'typeorm';
 
 import type { AuthenticatedUser } from '../auth/jwt-payload';
@@ -139,7 +140,22 @@ export class AssignmentsService {
       }
     }
 
-    await this.assignmentsRepository.delete({ tenantId, id });
+    try {
+      await this.assignmentsRepository.delete({ tenantId, id });
+    } catch (err) {
+      // Step 18 / ADR-026: `sessions.assignment_id` es FK RESTRICT. Si hay
+      // sesiones contra esta asignación, no se puede borrar — el cliente
+      // tiene que limpiar la historia antes (o, en el flow real, simplemente
+      // dejar la asignación expirar).
+      if (isForeignKeyViolation(err, 'fk_sessions_assignment')) {
+        throw new ConflictException({
+          code: 'ASSIGNMENT_HAS_SESSIONS',
+          message:
+            'No se puede borrar la asignación: tiene sesiones ejecutadas asociadas.',
+        });
+      }
+      throw err;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -200,4 +216,16 @@ export class AssignmentsService {
       message,
     });
   }
+}
+
+/**
+ * `true` si el error es 23503 y el constraint mencionado matchea
+ * `constraintName`. Duplicado del helper análogo en `routines.service.ts`;
+ * si aparece un tercer caller se extrae a `common/`.
+ */
+function isForeignKeyViolation(err: unknown, constraintName: string): boolean {
+  if (!(err instanceof QueryFailedError)) return false;
+  const driverError = (err as { driverError?: { code?: string } }).driverError;
+  if (driverError?.code !== '23503') return false;
+  return err.message.includes(constraintName);
 }

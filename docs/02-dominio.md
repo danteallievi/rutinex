@@ -145,31 +145,36 @@ Tenant (olimpo)
 
 Una sesión es la ejecución de una rutina asignada en una fecha.
 
-| Campo              | Tipo          | Notas                                                                          |
-| ------------------ | ------------- | ------------------------------------------------------------------------------ |
-| `id`               | uuid PK       |                                                                                |
-| `tenant_id`        | uuid FK       |                                                                                |
-| `assignment_id`    | uuid FK       |                                                                                |
-| `student_id`       | uuid FK→users |                                                                                |
-| `routine_snapshot` | jsonb         | Snapshot de la rutina al momento de empezar (por si la rutina cambia después). |
-| `started_at`       | timestamptz   |                                                                                |
-| `completed_at`     | timestamptz   | Nullable mientras está en curso.                                               |
+| Campo              | Tipo          | Notas                                                                                              |
+| ------------------ | ------------- | -------------------------------------------------------------------------------------------------- |
+| `id`               | uuid PK       |                                                                                                    |
+| `tenant_id`        | uuid FK       | FK RESTRICT a `tenants`.                                                                           |
+| `assignment_id`    | uuid FK       | FK RESTRICT a `assignments`. Borrar un assignment con sesiones tira 409 (ADR-026).                 |
+| `routine_id`       | uuid FK       | FK RESTRICT a `routines`. Snapshot inline + FK al routine vivo (trazabilidad). ADR-026.            |
+| `student_id`       | uuid FK→users |                                                                                                    |
+| `routine_snapshot` | jsonb         | Shape de `RoutineResponse` (Step 16): items inline con `exercise` resuelto. Inmutable post-create. |
+| `started_at`       | timestamptz   |                                                                                                    |
+| `completed_at`     | timestamptz   | Nullable mientras está en curso. Una vez seteado, la sesión es inmutable.                          |
+
+**Constraints e índices**:
+
+- `UNIQUE (assignment_id) WHERE completed_at IS NULL` — sólo 1 sesión abierta por asignación (`uq_sessions_assignment_open`, ADR-026 §4).
 
 ### `sets`
 
-| Campo             | Tipo         | Notas                                     |
-| ----------------- | ------------ | ----------------------------------------- |
-| `id`              | uuid PK      |                                           |
-| `session_id`      | uuid FK      |                                           |
-| `routine_item_id` | uuid FK      |                                           |
-| `exercise_id`     | uuid FK      | Denormalizado para queries de PR rápidas. |
-| `student_id`      | uuid FK      | Denormalizado por la misma razón.         |
-| `tenant_id`       | uuid FK      |                                           |
-| `set_number`      | int          | 1, 2, 3...                                |
-| `reps`            | int          | Reps ejecutadas.                          |
-| `weight_kg`       | numeric(6,2) | Nullable (bodyweight).                    |
-| `rpe`             | numeric(3,1) | Nullable. Fase 2.                         |
-| `created_at`      | timestamptz  |                                           |
+| Campo             | Tipo         | Notas                                                                                                                                        |
+| ----------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`              | uuid PK      |                                                                                                                                              |
+| `session_id`      | uuid FK      | FK CASCADE — borrar la sesión borra sus sets.                                                                                                |
+| `routine_item_id` | uuid FK      | **Nullable + ON DELETE SET NULL**: el snapshot tiene los datos del item; si el PATCH del routine lo borra, los sets sobreviven (ADR-026 §6). |
+| `exercise_id`     | uuid FK      | Denormalizado para queries de PR rápidas. FK RESTRICT.                                                                                       |
+| `student_id`      | uuid FK      | Denormalizado por la misma razón. FK RESTRICT.                                                                                               |
+| `tenant_id`       | uuid FK      | FK RESTRICT.                                                                                                                                 |
+| `set_number`      | int          | 1, 2, 3... Único por `(session_id, routine_item_id, set_number)` — validado en service (ADR-026 §7).                                         |
+| `reps`            | int          | Reps ejecutadas. >= 0.                                                                                                                       |
+| `weight_kg`       | numeric(6,2) | Nullable (bodyweight). En TypeORM mapea a `string` — convertir a `number` cuando se arme la response.                                        |
+| `rpe`             | numeric(3,1) | Nullable. Fase 2.                                                                                                                            |
+| `created_at`      | timestamptz  |                                                                                                                                              |
 
 ### `personal_records`
 
@@ -220,8 +225,8 @@ tenants ──< users
 
 routines ──< routine_items >── exercises
 assignments >── routines
-sessions >── assignments
-sets >── sessions, routine_items, exercises
+sessions >── assignments, routines
+sets >── sessions, routine_items (nullable), exercises
 personal_records >── exercises, sets
 ```
 
@@ -269,11 +274,11 @@ personal_records >── exercises, sets
 ### F5 — Ejecución por STUDENT
 
 1. STUDENT entra a `<slug>.rutinex.app`, login, ve "Hoy" como home.
-2. Si hay una asignación vigente cuyo `weekday_mask` matchea hoy, ve la rutina.
-3. Toca "Comenzar" → se crea una `session` con snapshot de la rutina.
-4. Por cada ejercicio, ve título/descripción/media. Carga reps + peso por set. Se crean filas en `sets`.
-5. Al terminar el último ejercicio, marca como completada (`completed_at`).
-6. Background (o on-the-fly): si algún set supera el PR previo del alumno en ese ejercicio, se upserta en `personal_records`.
+2. Frontend llama `GET /sessions/today`. Si hay una asignación activa cuyo `weekday_mask` matchea hoy (`Date.getUTCDay()` para el bit), responde con `{ assignmentId, routine: <snapshot live>, openSessionId }`. `null` si no hay nada para hoy.
+3. Toca "Comenzar" → `POST /sessions { assignmentId }`. El service valida que el assignment esté `active` (no se requiere matchear weekday — el STUDENT puede ejecutar al día siguiente; ADR-026 §5). 1 sesión abierta por asignación (UNIQUE parcial); si ya hay una, el flow reanuda con el `openSessionId` devuelto en `today`.
+4. Por cada ejercicio del snapshot, ve título/descripción/media. Carga reps + peso por set vía `POST /sessions/:id/sets { routineItemId, setNumber, reps, weightKg? }`. El service valida que `routineItemId` esté en el snapshot (no en la tabla viva) y que el `setNumber` sea único por `(session, routine_item)`.
+5. Al terminar, `POST /sessions/:id/complete` setea `completed_at`. La sesión queda inmutable (más sets o re-complete → 400 `SESSION_ALREADY_COMPLETED`).
+6. Background (o on-the-fly): si algún set supera el PR previo del alumno en ese ejercicio, se upserta en `personal_records` (Step 19, todavía no implementado).
 
 ### F6 — Prender/apagar STUDENT
 
@@ -284,4 +289,4 @@ personal_records >── exercises, sets
 
 - **Toda tabla excepto `tenants` tiene `tenant_id` NOT NULL** (incluso `refresh_tokens`).
 - **No cross-tenant references**: ningún FK puede apuntar a una fila de otro tenant. Esto se garantiza vía guards a nivel app, no a nivel DB (sería caro hacerlo con triggers).
-- **`exercises`, `routines`, `routine_items` son inmutables una vez referenciados por una sesión**: si una rutina ya tiene sesiones ejecutadas, edits crean una nueva versión o se permiten solo en campos cosméticos. (Por eso `sessions` guarda `routine_snapshot`.)
+- **Snapshot inmutable, rutina viva mutable** (ADR-026): cuando una `session` se crea, congela `routine_snapshot` con el shape de `RoutineResponse`. La rutina viva puede seguir editándose (PATCH replace-all de items) sin afectar el snapshot. **No** se puede borrar la rutina mientras tenga sesiones (FK RESTRICT `sessions.routine_id` → 409 `ROUTINE_HAS_SESSIONS`) ni borrar la asignación si tiene sesiones (FK RESTRICT `sessions.assignment_id` → 409 `ASSIGNMENT_HAS_SESSIONS`). `routine_items` se borran libremente vía PATCH replace-all — los `sets` apuntan al id original con `ON DELETE SET NULL`, así que sobreviven con el snapshot como fuente de verdad de qué ejercicio fue.

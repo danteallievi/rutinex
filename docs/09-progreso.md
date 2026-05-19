@@ -5,8 +5,8 @@ Estado actual del proyecto. Este archivo lo mantiene Claude Code (y vos) actuali
 ## Estado general
 
 **Fase actual**: Fase 1 — Backend foundations.
-**Paso actual**: Step 17 completo. Próximo: Step 18 — Sesión + tracking de sets.
-**Última actualización**: 2026-05-18 — Step 17 (Assignments + ADR-025).
+**Paso actual**: Step 18 completo. Próximo: Step 19 — Personal Records.
+**Última actualización**: 2026-05-18 — Step 18 (Sessions + Sets + ADR-026).
 
 ## Cambios de doc
 
@@ -848,9 +848,71 @@ Notas:
 - El test de filter status=active usa `Date` actual del runtime (no fake timer) y seedea fechas relativas (today, 1999, 2099). Mantiene el spec robusto si lo corremos en cualquier momento — el límite real está en que el año 2099 deja de ser futuro algún día, pero será otro problema.
 - `RoutinesService.remove` ahora tiene un try/catch — la única forma de cambiar el comportamiento del happy path es si Postgres tira un 23503 con un constraint distinto a `fk_assignments_routine`, caso que no se da hoy. Si más adelante aparece otra FK RESTRICT que apunte a `routines` (e.g. desde `sessions` en Step 18), se agrega un branch al chequeo.
 
+### Step 18 — Sesión + tracking de sets (2026-05-18)
+
+Entities `Session` (snapshot inmutable de `RoutineResponse` en jsonb + FK RESTRICT al routine vivo) y `WorkoutSet` (clase TypeScript, tabla `sets`) con 5 endpoints: `POST /sessions`, `GET /sessions/today`, `POST /sessions/:id/sets`, `POST /sessions/:id/complete`, `GET /sessions` (cursor pagination). Decisiones cristalizadas en **ADR-026** (snapshot completo + FK RESTRICT, una sesión abierta por assignment vía UNIQUE parcial, weekdayMask flexible en POST pero estricto en today, sets.routine_item_id nullable + SET NULL para sobrevivir PATCH replace-all, unicidad de set en service por NULL en routine_item_id, cursor base64url, jerarquía en service, codes).
+
+**Entities + migración**: `Session` en `apps/api/src/modules/sessions/entities/session.entity.ts` con `id`, `tenantId` (FK RESTRICT a tenants), `assignmentId` (FK RESTRICT a assignments), `routineId` (FK RESTRICT a routines), `studentId` (FK RESTRICT a users), `routineSnapshot` (jsonb, type alias `SessionRoutineSnapshot = RoutineResponse`), `startedAt` (@CreateDateColumn), `completedAt` nullable. Índices: `ix_sessions_tenant_id`, `ix_sessions_assignment_id`, `ix_sessions_routine_id`, `ix_sessions_student_id`, y el UNIQUE parcial `uq_sessions_assignment_open ON sessions(assignment_id) WHERE completed_at IS NULL`. `WorkoutSet` en `entities/set.entity.ts` (tabla `sets`) con `id`, `tenantId` (FK RESTRICT), `sessionId` (FK CASCADE), `routineItemId` (nullable + FK SET NULL), `exerciseId` (FK RESTRICT), `studentId` (FK RESTRICT), `setNumber` (int), `reps` (int), `weightKg` (numeric(6,2) nullable, mapea a `string` en TypeORM), `createdAt`. Índices: 5 ix*sets*\* en cada FK column.
+
+Migración `apps/api/src/migrations/1779520000000-InitSessionsAndSets.ts` a mano (mismo patrón que `InitAssignments`): crea ambas tablas con FKs nombrados explícito, índices y el partial unique como `CREATE UNIQUE INDEX ... WHERE`. Up/down testeados (revert + re-run dejan estado limpio); drift check con `migration:generate` no encuentra cambios — el partial unique se declara también en la entity con `@Index('uq_sessions_assignment_open', ['assignmentId'], { unique: true, where: '"completed_at" IS NULL' })` para que TypeORM no lo marque como drift.
+
+**`SessionsRepository`**: extiende `TenantScopedRepository<Session>` (mismo patrón Step 16/17). Sets se manejan vía `manager.getRepository(WorkoutSet)` directo en transacciones — las queries siempre filtran por `(tenantId, sessionId)`.
+
+**`SessionsService`** (`apps/api/src/modules/sessions/sessions.service.ts`):
+
+- `create(tenantId, actor, dto)`: lookup assignment tenant-scoped (404 ASSIGNMENT_NOT_FOUND), valida `actor.userId === assignment.studentId` (403 FORBIDDEN_ROLE_HIERARCHY), valida `status === 'active'` reusando `computeAssignmentStatus` (400 ASSIGNMENT_NOT_ACTIVE), chequea no haya sesión abierta (409 SESSION_ALREADY_OPEN), llama `buildRoutineSnapshot` que arma un `RoutineResponse` con items y exercises resueltos, inserta la session. Todo dentro de `DataSource.transaction`.
+- `getToday(tenantId, actor)`: sólo STUDENT (otros roles → null). Calcula `dayBit = 1 << Date.getUTCDay()` y busca assignment del actor cuya weekdayMask matchee (`a.weekday_mask & :dayBit > 0`) + esté en rango. Devuelve `{ assignmentId, routineId, routine: <snapshot live>, openSessionId }` o null. El snapshot live se construye igual que en create — útil para que la UI muestre lo que va a ejecutar sin POST previo.
+- `addSet(tenantId, actor, sessionId, dto)`: lookup session tenant-scoped (404 SESSION_NOT_FOUND), valida actor=studentId (403), valida `completedAt === null` (400 SESSION_ALREADY_COMPLETED), valida `routineItemId` contra `session.routineSnapshot.items[]` (400 SET_INVALID_ROUTINE_ITEM — contra el snapshot, no la tabla viva), chequea unicidad `(sessionId, routineItemId, setNumber)` (409 SET_NUMBER_DUPLICATED), inserta el set con `exerciseId` derivado del snapshot. Releer todos los sets de la sesión para devolver el `SessionResponse` completo.
+- `complete(tenantId, actor, sessionId)`: lookup + actor check + already-completed check, setea `completedAt = new Date()` con `update({ id }, { completedAt })`. Devuelve el `SessionResponse` con sets ordenados.
+- `list(tenantId, actor, query)`: jerarquía explícita por role (STUDENT forzado a self, TRAINER restringido a sus students vía subquery SQL `student_id IN (SELECT id FROM users WHERE trainer_id = :actor)` si no pasa studentId, OWNER libre). QB con `tenant_id` primero, filtros `from`/`to` (date → timestamptz inclusivo del día completo), cursor opaco base64url, orden `(started_at DESC, id DESC)`, `take(limit + 1)` para detectar `hasMore`. Cursor inválido se ignora (vuelve a primera página). Response: `SessionListItemResponse` ligero (sin snapshot ni sets, sólo metadata + `routineName` del snapshot).
+
+**`SessionsController`** (`apps/api/src/modules/sessions/sessions.controller.ts`): prefix `/sessions`. `POST /sessions`, `POST /sessions/:id/sets`, `POST /sessions/:id/complete`, `GET /sessions/today` → `@Roles('STUDENT')`. `GET /sessions` sin `@Roles` (jerarquía en service). `complete` devuelve 200 (no 204) con body.
+
+**DTOs** (`apps/api/src/modules/sessions/dto/`):
+
+- `CreateSessionDto`: `{ assignmentId: uuid }`.
+- `AddSetDto`: `{ routineItemId: uuid, setNumber: int ≥ 1, reps: int ≥ 0, weightKg?: number ≥ 0 con maxDecimalPlaces:2, max 9999.99, acepta null }`. `@ValidateIf((_, v) => v !== null)` para que `null` explícito no gatille `@IsNumber`.
+- `ListSessionsQueryDto`: `{ studentId?, from?, to? (ISO date strict), limit? (1-100, default 20), cursor? }`.
+- `SessionResponse`, `SetResponse`, `SessionListItemResponse`, `TodaySessionResponse`, `CursorPaginatedSessionsResponse` + helpers (`toSessionResponse(session, sets)`, `toSetResponse(set)` — convierte `weightKg: string | null` a `number | null`).
+- `SessionRoutineSnapshot` (type alias de `RoutineResponse`) en `dto/session-snapshot.ts`.
+- `cursor.ts`: `encodeCursor`/`decodeCursor` con base64url + parse defensivo (`null` si no decodea).
+
+**Cross-cutting: captura 23503**:
+
+- `RoutinesService.remove`: agregado branch `fk_sessions_routine` → 409 `ROUTINE_HAS_SESSIONS`. El helper `isForeignKeyViolation` ya estaba del Step 17.
+- `AssignmentsService.removeByActor`: wrap try/catch nuevo. `fk_sessions_assignment` → 409 `ASSIGNMENT_HAS_SESSIONS`. Helper duplicado al pie del archivo (extraer a `common/` cuando aparezca un cuarto caller).
+
+**Códigos de error nuevos** (`docs/05-api-conventions.md`):
+
+- 404 `SESSION_NOT_FOUND`, 409 `SESSION_ALREADY_OPEN`, 400 `ASSIGNMENT_NOT_ACTIVE`, 400 `SESSION_ALREADY_COMPLETED`, 400 `SET_INVALID_ROUTINE_ITEM`, 409 `SET_NUMBER_DUPLICATED` (módulo sessions).
+- 409 `ROUTINE_HAS_SESSIONS` (módulo routines).
+- 409 `ASSIGNMENT_HAS_SESSIONS` (módulo assignments).
+
+Reuso: `FORBIDDEN_ROLE` (RolesGuard), `FORBIDDEN_ROLE_HIERARCHY` (service), `ASSIGNMENT_NOT_FOUND` (Step 17), `TENANT_SLUG_REQUIRED`/`TENANT_MISMATCH` (Step 10).
+
+**Tests**:
+
+- Unit (`sessions.service.spec.ts`, 20 cases): create (happy path con snapshot armado, 404 assignment, 403 cross-student, 400 expirada, 400 futura, 409 ya abierta). addSet (happy path con weightKg redondeado, weightKg=null bodyweight, 404 session, 403 cross-student, 400 completada, 400 routineItemId fuera del snapshot, 409 setNumber duplicado). complete (happy, 404, 403, 400 ya completada). list — jerarquía (STUDENT cross 403, TRAINER cross 403, OWNER sin filtros pasa QB stubbed). Mocks de `DataSource.transaction` con `manager.getRepository` redirigido a mocks por entity (Assignment/Routine/RoutineItem/Exercise/Session/WorkoutSet/User).
+- E2E (`sessions.e2e-spec.ts`, 38 cases): cubre los 5 endpoints + cross-cutting. POST /sessions (happy STUDENT, OWNER/TRAINER 403, cross-student 403, futura 400, 404 inexistente, 404 cross-tenant, 409 already_open, reapertura post-complete OK, 401 sin bearer). GET /sessions/today (con asignación matcheando, con sesión abierta → openSessionId, sin asignación → body vacío `''`, OWNER 403). POST /sessions/:id/sets (happy con weightKg 60.5 → "60.50" en DB, weightKg ausente → null, weightKg=null → null, 404 session, 403 cross-student, 400 completada, 400 routineItemId foreign, 409 setNumber duplicado, 400 setNumber=0, 400 weightKg negativo, 400 reps negativo). POST /sessions/:id/complete (happy, 400 ya completada). GET /sessions (STUDENT ordenado DESC, 403 cross-studentId, TRAINER ve sólo lo suyo, OWNER con studentId arbitrario, cross-tenant no se cruza, cursor pagination con limit=2 sobre 3 → nextCursor + segunda página, filtros from/to filtran range, limit=200 → 400, cursor inválido se ignora). Cross-cutting (DELETE assignment con sesión → 409 ASSIGNMENT_HAS_SESSIONS, DELETE routine con assignment+sesión → 409 ROUTINE_HAS_ASSIGNMENTS o ROUTINE_HAS_SESSIONS según orden de catches, limpieza ordenada session→assignment→routine).
+
+**Wiring**: `SessionsModule` registra controller + service + repository, `TypeOrmModule.forFeature([Session, WorkoutSet])`. `AppModule` lo importa después de `AssignmentsModule`. No depende de `AssignmentsModule`/`RoutinesModule`/`UsersModule` — usa `dataSource.getRepository` directo para lookups cross-module (mismo patrón que Step 16/17).
+
+Verificación: `pnpm lint` clean en root. `pnpm format:check` clean. `pnpm --filter @rutinex/api test` 292/292 (272 previos + 20 nuevos en sessions-service). `pnpm --filter @rutinex/api test:e2e` 284/284 (246 previos + 38 nuevos en sessions.e2e-spec.ts).
+
+Archivos clave: `apps/api/src/modules/sessions/{sessions.module,sessions.controller,sessions.service,sessions.service.spec,sessions.repository}.ts`, `apps/api/src/modules/sessions/entities/{session,set}.entity.ts`, `apps/api/src/modules/sessions/dto/{create-session.dto,add-set.dto,list-sessions.query.dto,session.response,session-snapshot,cursor}.ts`, `apps/api/src/migrations/1779520000000-InitSessionsAndSets.ts`, `apps/api/src/modules/routines/routines.service.ts` (branch fk_sessions_routine), `apps/api/src/modules/assignments/assignments.service.ts` (captura fk_sessions_assignment + `isForeignKeyViolation` local), `apps/api/src/app.module.ts` (import), `apps/api/test/sessions.e2e-spec.ts`, `docs/02-dominio.md` (sessions con routine_id, sets routine_item nullable, F5 detallado, regla snapshot inmutable), `docs/05-api-conventions.md` (codes), `docs/08-decisiones.md` (ADR-026).
+
+Notas:
+
+- `WorkoutSet` se llama así (no `Set`) para evitar shadow del global JS. La tabla es `sets`. El alias del entity y los lookups TypeScript usan `WorkoutSet`; nada cambia en wire/SQL.
+- El test "STUDENT sin today" verifica `res.text === ''`: NestJS/Express convierte `return null` en body vacío (no JSON literal `'null'`). El cliente lo interpreta como "no hay today".
+- El cursor base64url se transmite tal cual en query string. `encodeURIComponent` en el lado del frontend para garantizar transporte limpio. El test lo hace explícito.
+- `weightKg` en TypeORM mapea numeric(6,2) → `string`. El service insertea con `.toFixed(2)` (`60.5` → `"60.50"`) y la response convierte a `number` con `Number(...)`. Persistencia comprobada en DB con un assertion `dbSet.weightKg === '60.50'`.
+- El UNIQUE parcial sólo cubre `WHERE completed_at IS NULL`. Dos sesiones completadas sobre el mismo assignment con el mismo `started_at` no violan ningún constraint — el caller debería ordenarse por `(started_at, id)` y aceptar duplicados como histórico legítimo.
+- La inmutabilidad de `routine_items.id` post-PATCH (ADR-024 §3) se valida acá: si un trainer hace PATCH replace-all del routine mientras una sesión está abierta, los `routineItemId` del snapshot ya no existen en la tabla viva, pero `sets.routine_item_id` con `ON DELETE SET NULL` y la validación contra snapshot (no contra tabla) mantienen el flow funcionando — el STUDENT termina la sesión con el snapshot original.
+
 ## Próxima acción concreta
 
-Step 18 — Sesión + tracking de sets. Entities `Session` (con `routine_snapshot` jsonb, `assignment_id`, `started_at`, `completed_at?`) y `Set` (con `session_id`, `routine_item_id`, `exercise_id` y `student_id` denormalizados, `set_number`, `reps`, `weight_kg?`). Endpoints: `POST /sessions` (arranca, snapshotea), `POST /sessions/:id/sets`, `POST /sessions/:id/complete`. Ver criterios completos en `docs/07-roadmap.md` → Step 18. Acá se cristaliza la inmutabilidad post-asignación de routines (ADR-024 sección 6) — decidir si `sessions.routine_id` es FK RESTRICT o si guardamos sólo el snapshot.
+Step 19 — Personal Records. Entity `PersonalRecord` (`tenant_id`, `student_id`, `exercise_id`, `record_type`, `weight_kg`, `reps`, `achieved_at`, `set_id`) + migración. Cálculo dentro de la transacción de `POST /sessions/:id/sets`: si el set supera el PR previo, upsert. Endpoints `GET /students/:id/personal-records` y `GET /students/:id/personal-records/:exerciseId`. Criterio del roadmap: E2E con test de concurrencia (dos POST simultáneos no rompen el PR — transacción + isolation). Ver `docs/07-roadmap.md` → Step 19.
 
 ## Pendientes / deudas técnicas
 

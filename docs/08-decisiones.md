@@ -1048,4 +1048,121 @@ Si aparece el caso "duplicado accidental al mash-clickear" lo manejamos con un c
 
 ---
 
+## ADR-026 — Sessions + Sets: snapshot inmutable, una sesión abierta por assignment, sets atómicos
+
+**Contexto**: el Step 18 introduce `sessions` y `sets` — la ejecución concreta de una rutina por parte de un STUDENT. Cierra varias decisiones que ADR-024 §6 y ADR-025 dejaron diferidas (qué hace `sessions.routine_id`, qué guarda el snapshot, cómo reacciona el sistema al `PATCH/DELETE` de routines/assignments con sesiones).
+
+**Decisiones**:
+
+### 1. Endpoints (5)
+
+Implementa la lista literal del roadmap:
+
+- `POST /sessions` (`@Roles('STUDENT')`): arranca una sesión sobre un `assignmentId`. Snapshotea la rutina en jsonb.
+- `GET /sessions/today` (`@Roles('STUDENT')`): devuelve la asignación activa que matchea hoy según `weekday_mask` + snapshot live + `openSessionId` si hay sesión en curso. `null` si no hay nada para hoy.
+- `POST /sessions/:id/sets` (`@Roles('STUDENT')`): carga un set.
+- `POST /sessions/:id/complete` (`@Roles('STUDENT')`): cierra la sesión.
+- `GET /sessions` (sin `@Roles`): cursor pagination. OWNER ve todo, TRAINER sólo lo de sus students (con subquery en SQL si no hay `?studentId`), STUDENT sólo lo suyo. Filtros opcionales `studentId`, `from`, `to` (date-only).
+
+`POST /sessions/:id/complete` devuelve **200** (no 204) con el body completo de la sesión cerrada — el frontend usa la response para confirmar el estado final sin un GET adicional. Para sets devolvemos **201** con la sesión completa (también vale para sumar sets en bucle: el cliente refresca con el response de cada POST).
+
+### 2. `Session.routine_id` FK RESTRICT + snapshot completo
+
+`sessions` lleva tanto `routine_id` (FK RESTRICT al routine vivo) como `routine_snapshot` (jsonb con la rutina congelada al momento del POST). Razones:
+
+- La FK al routine vivo da trazabilidad: queries como "todas las sesiones de la routine X" sólo necesitan un join indexado, no un scan jsonb. Útil para reports del trainer.
+- El snapshot defiende la inmutabilidad histórica: el STUDENT siempre ve la rutina como era cuando arrancó, sin importar PATCHes posteriores del trainer.
+- Borrar la routine con sesiones tira `23503` (constraint `fk_sessions_routine`), traducido a **409 `ROUTINE_HAS_SESSIONS`** en `RoutinesService.remove`. Simétrico a `ROUTINE_HAS_ASSIGNMENTS` del Step 17. En la práctica MVP esto casi no sucede (las rutinas no se borran), pero el constraint protege contra accidentes.
+
+Alternativa descartada (sólo snapshot, sin FK): pierde el join indexado y obliga a un scan jsonb para queries por routine. Beneficio (borrar libremente la routine sin tocar la historia) no compensa — el hard delete de routines en MVP es rarísimo.
+
+### 3. Snapshot shape = `RoutineResponse`
+
+`routine_snapshot` se guarda con el shape exacto de `RoutineResponse` del Step 16: `{ id, name, description, createdBy, createdAt, updatedAt, items: [{ id, exerciseId, position, prescribedX..., notes, exercise: { id, title, description, mediaUrl, mediaType, muscleGroups, createdBy, createdAt, updatedAt } }] }`.
+
+Por qué shape completo (no sólo ids + datos prescritos):
+
+- El cliente puede renderizar la sesión sin un GET adicional al exercise. Crítico para offline-first UX si en el futuro queremos cachear sesiones.
+- Si el exercise se edita después (título, descripción, media), la historia queda intacta — el STUDENT recuerda qué se ejecutó.
+- El costo es bytes en jsonb. Para una rutina típica de 5-10 items con descriptions cortas son ~5-15KB por sesión — barato para Postgres.
+
+Es un _type alias_ de `RoutineResponse` (`SessionRoutineSnapshot = RoutineResponse`). Si más adelante `RoutineResponse` cambia de forma incompatible, se versiona el snapshot acá (jsonb tolera shapes históricos en lectura).
+
+### 4. Una sesión abierta por `(assignment_id)`
+
+UNIQUE parcial `uq_sessions_assignment_open ON sessions(assignment_id) WHERE completed_at IS NULL`. El service rechaza con **409 `SESSION_ALREADY_OPEN`** antes del INSERT para dar un `code` parseable.
+
+Razones:
+
+- Modelo simple: el flow "Comenzar" en la app del STUDENT crea o reanuda. Si hay una abierta, `GET /sessions/today` devuelve `openSessionId` y la UI reanuda.
+- Evita estados ambiguos en la UI (¿en cuál sesión cargo el set? — la única abierta).
+- No bloquea casos legítimos: el STUDENT cierra la actual y arranca una nueva sobre la misma asignación inmediatamente después. Sólo bloquea el caso "doble tap arranca dos sesiones".
+
+Alternativa descartada (sin constraint): obliga al frontend a manejar el caso "¿qué sesión está activa?" — fricción innecesaria para un caso que el dominio no quiere.
+
+### 5. `POST /sessions` valida `active`, **no** valida `weekdayMask`
+
+El service chequea que el assignment esté `active` (`startsOn <= today <= endsOn`) con el mismo helper que computa `AssignmentResponse.status`. Si no, **400 `ASSIGNMENT_NOT_ACTIVE`**.
+
+**No** chequea `weekdayMask` contra `today`. Razón: el STUDENT puede ejecutar "lo de ayer hoy" (faltó al gimnasio, lo recupera al día siguiente). Bloquearlo con un weekdayMask estricto agrega fricción para el caso real del PT con alumnos que reagendan.
+
+`GET /sessions/today` sí filtra por weekdayMask — es el "sugerido del día". El POST no lo refuerza para mantener flexibilidad.
+
+### 6. `sets.routine_item_id` nullable + `ON DELETE SET NULL`
+
+ADR-024 §3 dejó claro que el PATCH replace-all de routines borra los `routine_items` viejos y crea nuevos (ids no estables). Si los sets fueran FK RESTRICT a routine_items, el PATCH se rompería con un 23503 en el primer item con sets ejecutados — bloqueando la edición del trainer.
+
+Solución: `sets.routine_item_id` nullable + `ON DELETE SET NULL`. El snapshot tiene los datos del item (vía `routine_snapshot.items[].id`), así que el sistema sabe a qué ejercicio corresponde el set aunque el routine_item haya sido reemplazado.
+
+Validación del `routineItemId` en `POST /sessions/:id/sets`: contra el **snapshot** (no la tabla viva). Si el id no existe en `session.routine_snapshot.items[]`, **400 `SET_INVALID_ROUTINE_ITEM`**. Esto preserva la coherencia incluso después de PATCHes del routine.
+
+`sets.exercise_id` permanece FK RESTRICT (los exercises no se borran si están en routines vivas o sets ejecutados — ADR-022 + cadena de RESTRICTs).
+
+### 7. Unicidad del set por `(session_id, routine_item_id, set_number)`
+
+El service rechaza un POST de set con `(setNumber, routineItemId)` ya existente con **409 `SET_NUMBER_DUPLICATED`**. Sin UNIQUE constraint en DB porque `routine_item_id` puede ser NULL (post SET NULL), y Postgres trata `NULL != NULL` en UNIQUE — el constraint no aplicaría a sets huérfanos.
+
+El service valida con un `findOne` previo. No exige consecutividad del `set_number` (el cliente puede mandar 1, 3, 2 — sólo que no se repita).
+
+Permitimos `reps = 0` (sets fallidos / lesión) y `weightKg = null` (bodyweight) o `weightKg = 0` (deload extremo). `weightKg` numeric(6,2) acepta hasta 9999.99kg.
+
+### 8. `GET /sessions` cursor pagination + filtros + jerarquía
+
+Cursor opaco: `base64url(JSON({ startedAt: ISO, id: uuid }))`. Orden `(started_at DESC, id DESC)`. `take(limit + 1)` para saber si hay más sin un count extra.
+
+- `STUDENT` con `?studentId` distinto a `actor.userId` → **403 `FORBIDDEN_ROLE_HIERARCHY`**. Sin filtro: implícito el suyo.
+- `TRAINER` con `?studentId` que no le pertenece → 403. Sin filtro: subquery en SQL (`student_id IN (SELECT id FROM users WHERE trainer_id = :actor)`).
+- `OWNER` libre.
+
+Filtros `from`/`to` son date-only (`YYYY-MM-DD`). El service convierte a timestamptz: `from` inclusivo desde `T00:00:00Z`, `to` inclusivo del día completo (exclusivo del día siguiente). Default `limit=20`, max 100.
+
+Cursor inválido (no decodea) se ignora silenciosamente: la lista vuelve a la primera página. Tradeoff: más permisivo, evita 400s por copy-paste de cursor stale del usuario.
+
+Cursor pagination en vez de offset porque las sesiones crecen indefinidamente con el uso real del STUDENT (decenas por mes). Convención general (Step 5 — `docs/05-api-conventions.md`): cursor para listas que crecen, offset para listas chicas (users del tenant, exercises).
+
+### 9. `WorkoutSet` como nombre de clase TypeScript
+
+La tabla SQL se llama `sets` (alineado con `docs/02-dominio.md`). La clase TypeScript es `WorkoutSet`, no `Set`, para evitar shadow del global `Set` de JS. Decisión defensiva: cualquier autoimport accidental de `Set` rompería el código silenciosamente; renombrar la clase elimina la ambigüedad.
+
+El nombre `WorkoutSet` no aparece en el wire ni en el SQL — sólo en imports TypeScript.
+
+### 10. Tabla de codes nuevos
+
+Documentada en `docs/05-api-conventions.md`:
+
+- **404 `SESSION_NOT_FOUND`**, **409 `SESSION_ALREADY_OPEN`**, **400 `ASSIGNMENT_NOT_ACTIVE`**, **400 `SESSION_ALREADY_COMPLETED`**, **400 `SET_INVALID_ROUTINE_ITEM`**, **409 `SET_NUMBER_DUPLICATED`** (módulo sessions).
+- **409 `ROUTINE_HAS_SESSIONS`** (módulo routines, cross-cutting captura del 23503 con `fk_sessions_routine`).
+- **409 `ASSIGNMENT_HAS_SESSIONS`** (módulo assignments, cross-cutting captura del 23503 con `fk_sessions_assignment`).
+
+**Consecuencias**:
+
+- `RoutinesService.remove` ahora maneja dos branches del 23503: `fk_assignments_routine` → `ROUTINE_HAS_ASSIGNMENTS`, `fk_sessions_routine` → `ROUTINE_HAS_SESSIONS`. Si más adelante aparece otra FK RESTRICT (e.g. `personal_records.routine_id`, improbable), se agrega un branch más.
+- `AssignmentsService.removeByActor` ahora maneja `fk_sessions_assignment` → `ASSIGNMENT_HAS_SESSIONS`. El helper `isForeignKeyViolation` está duplicado entre `routines.service.ts`, `assignments.service.ts` y `sessions.service.ts` — si aparece un cuarto caller se extrae a `common/`.
+- El frontend del STUDENT (Step 26) implementa el flow: cargar `today`, si hay `openSessionId` reanudar, sino "Comenzar" → snapshot inline → cargar sets uno por uno → "Terminar". La inmutabilidad post-complete simplifica la UX (no hay "edit set", el flow es lineal hasta complete).
+- El frontend del TRAINER (Step 25) puede mostrar el histórico vía `GET /sessions?studentId=X` con cursor. La response es ligera (`SessionListItemResponse` sin snapshot ni sets — sólo metadata y `routineName` del snapshot). Detalle expandido va con un `GET /sessions/:id` cuando aparezca esa pantalla (no implementado en Step 18 — el roadmap no lo pide).
+- **Riesgo**: el snapshot en jsonb crece linealmente con la cantidad de items de la rutina + sus descripciones. Para una rutina extrema con 50 items de descripción larga puede llegar a 100KB por sesión. Aceptable en MVP; si crece, evaluar partir items a una columna referencial separada o compresión jsonb (Postgres 16 soporta TOAST automático).
+- **Riesgo**: `weightKg` numeric en TypeORM mapea a `string`. El service hace `.toFixed(2)` al insertar y `Number(...)` al armar la response. Si en el futuro aparece un campo numeric más, vale extraer un helper `numericToNumber` en `common/`.
+
+---
+
 (Próximas decisiones se agregan acá con numeración consecutiva.)
